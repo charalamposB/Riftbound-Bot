@@ -1,24 +1,55 @@
 "use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 Object.defineProperty(exports, "__esModule", { value: true });
-require("dotenv/config");
-const tiktok_js_1 = require("./socials/tiktok.js");
+const tiktok_1 = require("./socials/tiktok");
 const discord_js_1 = require("discord.js");
-const market_js_1 = require("./marketplace/market.js");
-// -------- env helpers --------
-const requireEnv = (name) => {
-    const v = process.env[name];
-    if (!v || !v.trim())
-        throw new Error(`Missing required env var: ${name}`);
-    return v.trim();
-};
+const market_1 = require("./marketplace/market");
+const helpers_1 = require("./lib/helpers");
+const dotenv = __importStar(require("dotenv"));
+// Ανάλογα με το NODE_ENV φορτώνει το σωστό env file
+const envFile = process.env.NODE_ENV === "production" ? ".env.prod" : ".env.dev";
+dotenv.config({ path: envFile });
+console.log("Running with:", envFile);
 // -------- load env (typed) --------
-const token = requireEnv('TOKEN'); // Bot token
-const clientId = requireEnv('CLIENT_ID'); // Application (Client) ID
+const token = (0, helpers_1.requireEnv)('TOKEN'); // Bot token
+const clientId = (0, helpers_1.requireEnv)('CLIENT_ID'); // Application (Client) ID
 const guildId = process.env.GUILD_ID?.trim(); // optional for fast guild registration
 // -------- local commands (ping) --------
 const ping = new discord_js_1.SlashCommandBuilder().setName('ping').setDescription('Replies with Pong!');
 // -------- collect all commands --------
-const commands = [ping, ...(0, market_js_1.getMarketCommands)(), ...(0, tiktok_js_1.getTikTokCommands)()];
+const commands = [ping, ...(0, market_1.getMarketCommands)(), ...(0, tiktok_1.getTikTokCommands)()];
 const commandBodies = commands.map((c) => c.toJSON());
 // -------- register commands --------
 async function registerCommands() {
@@ -33,12 +64,12 @@ async function registerCommands() {
 async function main() {
     await registerCommands();
     const client = new discord_js_1.Client({ intents: [discord_js_1.GatewayIntentBits.Guilds] });
-    (0, tiktok_js_1.registerTikTokInteractions)(client);
+    (0, tiktok_1.registerTikTokInteractions)(client);
     client.once(discord_js_1.Events.ClientReady, () => {
         console.log(`🤖 Logged in as ${client.user?.tag}`);
         // Ξεκίνα TikTok logs
         try {
-            (0, tiktok_js_1.startTikTokWatcher)(client);
+            (0, tiktok_1.startTikTokWatcher)(client);
             console.log('🎵 TikTok watcher started');
         }
         catch (e) {
@@ -57,7 +88,7 @@ async function main() {
         }
     });
     // κουμπώνουμε ΟΛΑ τα market interactions (slash + buttons + modals)
-    (0, market_js_1.registerMarketInteractions)(client);
+    (0, market_1.registerMarketInteractions)(client);
     await client.login(token);
 }
 main().catch((err) => {

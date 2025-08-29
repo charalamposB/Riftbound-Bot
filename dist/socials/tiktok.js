@@ -3,15 +3,27 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.registerTikTokInteractions = registerTikTokInteractions;
 exports.startTikTokWatcher = startTikTokWatcher;
 exports.getTikTokCommands = getTikTokCommands;
-exports.registerTikTokInteractions = registerTikTokInteractions;
 const discord_js_1 = require("discord.js");
 const fs_1 = __importDefault(require("fs"));
 const path_1 = __importDefault(require("path"));
-const STATE_PATH = path_1.default.resolve('./tiktok_state.json');
+let _tiktokWired = false;
+function registerTikTokInteractions(client) {
+    if (_tiktokWired)
+        return; // <-- αποφυγή διπλής εγγραφής
+    _tiktokWired = true;
+    client.on('interactionCreate', async (interaction) => {
+        if (!interaction.isChatInputCommand())
+            return;
+        if (interaction.commandName !== 'tiktok')
+            return;
+        await handleTikTokSlash(interaction, client);
+    });
+}
+const STATE_PATH = path_1.default.resolve('./data/tiktok_state.json');
 const DEBUG_PATH = path_1.default.resolve('./tiktok_debug_item_list_webfull_json.txt');
-const DEFAULT_DEBUG_NAME = 'tiktok_debug_item_list_webfull_json.txt';
 const env = (name, optional = false) => {
     const v = process.env[name];
     if (!v && !optional)
@@ -34,52 +46,40 @@ function saveState(s) {
     }
     catch { }
 }
-/** Διαβάζει το τελευταίο video από το debug dump (τοπικό αρχείο). */
+/**
+ * Διαβάζει το τελευταίο video από το debug dump.
+ * Το δικό σου schema έχει `itemList` στην ρίζα.
+ */
 function readLatestFromDebugFile(verbose = false) {
     try {
-        const { chosen, candidates } = getDebugPath();
-        if (!chosen) {
+        if (!fs_1.default.existsSync(DEBUG_PATH)) {
             if (verbose)
-                console.log('[TikTok] Debug file not found. Tried:', candidates);
+                console.log('[TikTok] Debug file not found at', DEBUG_PATH);
             return null;
         }
         if (verbose)
-            console.log('[TikTok] Using debug file:', chosen);
-        const raw = fs_1.default.readFileSync(chosen, 'utf8');
+            console.log('[TikTok] Using debug file:', DEBUG_PATH);
+        const raw = fs_1.default.readFileSync(DEBUG_PATH, 'utf8');
         const data = JSON.parse(raw);
-        const list = data?.ItemList?.items ||
-            (data?.ItemModule && Object.values(data.ItemModule)) ||
-            data?.aweme_list ||
-            [];
-        const first = Array.isArray(list) && list.length > 0 ? list[0] : null;
-        if (!first)
+        const list = Array.isArray(data?.itemList) ? data.itemList : [];
+        if (verbose)
+            console.log('[TikTok] itemList length:', list.length);
+        if (!list.length)
             return null;
-        const id = first.id || first.aweme_id || first.awemeId;
-        const desc = first.desc || first.title || first.share_info?.share_title;
-        if (!id)
+        const first = list[0];
+        const id = first?.id;
+        const desc = first?.desc;
+        if (!id) {
+            if (verbose)
+                console.log('[TikTok] No id field in first item keys:', Object.keys(first || {}));
             return null;
+        }
         return { id: String(id), desc: desc ? String(desc) : undefined };
     }
     catch (e) {
         console.error('[TikTok] Failed to parse debug file:', e);
         return null;
     }
-}
-function getDebugPath() {
-    const fromEnv = process.env.TIKTOK_DEBUG_PATH?.trim();
-    const candidates = [
-        fromEnv || '', // 1) .env override
-        path_1.default.resolve(DEFAULT_DEBUG_NAME), // 2) ./<name>  (root)
-        path_1.default.resolve('./data', DEFAULT_DEBUG_NAME), // 3) ./data/<name>
-        path_1.default.join(process.cwd(), DEFAULT_DEBUG_NAME), // 4) cwd/<name>
-        path_1.default.join(process.cwd(), 'data', DEFAULT_DEBUG_NAME),
-        // όταν τρέχεις compiled (dist/)
-        path_1.default.join(__dirname, '../../', DEFAULT_DEBUG_NAME),
-        path_1.default.join(__dirname, '../../../', DEFAULT_DEBUG_NAME),
-        path_1.default.join(__dirname, '../../data', DEFAULT_DEBUG_NAME),
-    ].filter(Boolean);
-    const chosen = candidates.find(p => fs_1.default.existsSync(p)) || null;
-    return { chosen, candidates };
 }
 async function postLog(client, videoId, desc) {
     const username = env('TIKTOK_USERNAME');
@@ -119,10 +119,10 @@ function getTikTokCommands() {
             .setDescription('TikTok tools')
             .addSubcommand(sc => sc.setName('status').setDescription('Δείξε ποιο video έχει δημοσιευτεί τελευταία'))
             .addSubcommand(sc => sc.setName('check').setDescription('Διάβασε το debug file και αν υπάρχει νέο video, κάνε post'))
-            .addSubcommand(sc => sc.setName('debugpaths').setDescription('Δείξε paths που δοκιμάζει για το debug file'))
             .addSubcommand(sc => sc.setName('post')
             .setDescription('Αναγκαστικό post (με id ή το πιο πρόσφατο από το debug file)')
-            .addStringOption(o => o.setName('id').setDescription('TikTok video id (optional)'))),
+            .addStringOption(o => o.setName('id').setDescription('TikTok video id (optional)')))
+            .addSubcommand(sc => sc.setName('show').setDescription('Δείξε id/desc από το debug file')),
     ];
 }
 /** Handler για /tiktok */
@@ -134,16 +134,6 @@ async function handleTikTokSlash(i, client) {
             content: state.lastId
                 ? `📼 Τελευταίο posted video id: \`${state.lastId}\``
                 : '📼 Δεν έχει καταγραφεί posted video ακόμα.',
-            flags: discord_js_1.MessageFlags.Ephemeral,
-        });
-        return;
-    }
-    if (sub === 'debugpaths') {
-        const { chosen, candidates } = getDebugPath();
-        const lines = candidates.map(p => `${fs_1.default.existsSync(p) ? '✅' : '❌'} ${p}`);
-        await i.reply({
-            content: (chosen ? `**Using:** ${chosen}\n` : '**No file found**\n') +
-                lines.join('\n'),
             flags: discord_js_1.MessageFlags.Ephemeral,
         });
         return;
@@ -184,14 +174,28 @@ async function handleTikTokSlash(i, client) {
         await i.editReply(`✅ Έγινε post (latest από debug): \`${latest.id}\``);
         return;
     }
+    if (sub === 'show') {
+        const latest = readLatestFromDebugFile(true);
+        if (!latest) {
+            await i.reply({
+                content: '⚠️ Δεν μπόρεσα να διαβάσω/βρω item στο debug file.',
+                flags: discord_js_1.MessageFlags.Ephemeral,
+            });
+            return;
+        }
+        await i.reply({
+            content: `📄 Path: ${DEBUG_PATH}\n` +
+                `🆔 id: \`${latest.id}\`\n` +
+                (latest.desc ? `📝 desc: ${latest.desc.substring(0, 180)}…` : '📝 desc: (none)'),
+            flags: discord_js_1.MessageFlags.Ephemeral,
+        });
+        return;
+    }
 }
 /** Σύνδεση στο client για να δουλέψουν τα /tiktok subcommands */
-function registerTikTokInteractions(client) {
-    client.on('interactionCreate', async (interaction) => {
-        if (!interaction.isChatInputCommand())
-            return;
-        if (interaction.commandName !== 'tiktok')
-            return;
-        await handleTikTokSlash(interaction, client);
-    });
-}
+// export function registerTikTokInteractions(client: Client) {
+//   client.on('interactionCreate', async (interaction: Interaction) => {
+//     if (!interaction.isChatInputCommand()) return
+//     if (interaction.commandName !== 'tiktok') return
+//     await handleTikTokSlash(interaction as ChatInputCommandInteraction, client)
+//   })

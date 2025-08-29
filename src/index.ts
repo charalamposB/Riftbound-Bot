@@ -18,10 +18,15 @@ import {
   registerMarketInteractions, // θα χειριστεί ΟΛΑ τα market interactions
 } from './marketplace/market'
 
-import * as dotenv from 'dotenv';
-dotenv.config();
 import { requireEnv } from './lib/helpers'
 
+import * as dotenv from "dotenv";
+
+// Ανάλογα με το NODE_ENV φορτώνει το σωστό env file
+const envFile = process.env.NODE_ENV === "production" ? ".env.prod" : ".env.dev";
+dotenv.config({ path: envFile });
+
+console.log("Running with:", envFile);
 // -------- load env (typed) --------
 const token = requireEnv('TOKEN')        // Bot token
 const clientId = requireEnv('CLIENT_ID') // Application (Client) ID

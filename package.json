@@ -1,13 +1,13 @@
 {
   "scripts": {
-    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "dev:prod": "dotenv -e .env.prod -- ts-node-dev --respawn --transpile-only src/index.ts",
-    "dev:dev": "dotenv -e .env.dev -- ts-node-dev --respawn --transpile-only src/index.ts"
+    "dev": "cross-env NODE_ENV=development ts-node-dev --respawn --transpile-only src/index.ts",
+    "prod": "cross-env NODE_ENV=production node dist/index.js"
   },
   "devDependencies": {
     "@types/node": "^24.3.0",
+    "cross-env": "^10.0.0",
     "dotenv-cli": "^10.0.0",
     "ts-node-dev": "^2.0.0",
     "typescript": "^5.9.2"

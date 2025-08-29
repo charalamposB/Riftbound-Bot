@@ -15,5 +15,22 @@
       "outcome": "none",
       "reason": "fgvsdfgsd"
     }
+  },
+  "xq3wipyf": {
+    "pid": "xq3wipyf",
+    "threadId": "1411125681773088798",
+    "sellerId": "729994391019716608",
+    "buyerId": "729994391019716608",
+    "status": "completed_mod",
+    "firstConfirmBy": "seller",
+    "firstConfirmAt": "2025-08-29T23:12:56.543Z",
+    "caseThreadId": "1411125504114954282",
+    "controlsMessageId": "1411126414283116678",
+    "modResolution": {
+      "by": "729994391019716608",
+      "at": "2025-08-29T23:15:23.533Z",
+      "outcome": "none",
+      "reason": "sthsrhsrhs"
+    }
   }
 }
