@@ -1,0 +1,19 @@
+{
+  "p0lk2o65": {
+    "pid": "p0lk2o65",
+    "threadId": "1409952125445865654",
+    "sellerId": "729994391019716608",
+    "buyerId": "729994391019716608",
+    "status": "completed_mod",
+    "firstConfirmBy": "seller",
+    "firstConfirmAt": "2025-08-26T17:26:57.792Z",
+    "caseThreadId": "1409952088481333278",
+    "controlsMessageId": "1409952174389334076",
+    "modResolution": {
+      "by": "729994391019716608",
+      "at": "2025-08-26T17:27:57.091Z",
+      "outcome": "none",
+      "reason": "fgvsdfgsd"
+    }
+  }
+}
