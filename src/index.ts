@@ -18,9 +18,12 @@ import {
   registerMarketInteractions, // θα χειριστεί ΟΛΑ τα market interactions
 } from './marketplace/market'
 
+import { init as initPending } from './lib/pendingStore'
+import { startPendingCleanup } from './workers/pendingCleanup' // αν βάλεις το optional worker
 import { requireEnv } from './lib/helpers'
 
 import * as dotenv from "dotenv";
+import { debugPendingInfo } from './lib/pendingStore'
 
 // Ανάλογα με το NODE_ENV φορτώνει το σωστό env file
 const envFile = process.env.NODE_ENV === "production" ? ".env.prod" : ".env.dev";
@@ -53,6 +56,10 @@ async function registerCommands(): Promise<void> {
 
 // -------- start bot --------
 async function main(): Promise<void> {
+  await initPending()
+  console.log('[pendingStore]', debugPendingInfo())
+  startPendingCleanup() // optional
+
   await registerCommands()
 
   const client = new Client({ intents: [GatewayIntentBits.Guilds] })
