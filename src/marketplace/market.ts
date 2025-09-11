@@ -5,729 +5,768 @@
   TextInputStyle,
   ActionRowBuilder,
   EmbedBuilder,
-  ButtonBuilder,
-  ButtonStyle,
   PermissionFlagsBits,
   ChannelType,
   MessageFlags,
   Client,
   Interaction,
   GuildMember,
-} from 'discord.js'
-import fs from 'fs'
-import path from 'path'
-import {
-  getSlash, setSlash, deleteSlash,
-  getApproval, setApproval, deleteApproval,
-  PendingSlash, PendingApproval,
-} from '../lib/pendingStore'
+  ThreadChannel,
+} from 'discord.js';
+
+import { buildCaseReviewRow, buildPublicPostRow, buildCommThreadRow } from './ui/components';
+import { buildPublicPostEmbed, buildCaseSummaryEmbed } from './ui/embeds';
+import type { CaseStatus, Kind } from './types';
+
+import fs from 'fs';
+import path from 'path';
 
 /* =========================================================
-   Types
+   Types (τοπικά για το αρχείο)
 ========================================================= */
-type Kind = 'sell' | 'buy'
+
+type PendingSlash = {
+  kind: Kind;
+  photo1: any;
+  photo2: any;
+};
+
+type PendingApproval = {
+  pid: string;
+  kind: Kind;
+  cardName: string;
+  price: number | null;
+  quantity: number;
+  location: string;
+  extra: string;
+  photo1?: { url: string } | null;
+  photo2?: { url: string } | null;
+
+  caseThreadId: string;
+  caseMessageId: string;
+
+  postedMessageId?: string;
+  postedChannelId?: string;
+
+  requesterId: string; // seller (στο SELL) / buyer (στο BUY)
+  buyerId?: string;    // ο αγοραστής όταν ολοκληρωθεί (ή last interested)
+
+  // για refresh του CASE panel
+  contacts: Set<string>;
+  status?: CaseStatus;
+  firstConfirmBy?: string;
+  firstConfirmAt?: number;
+  sellerConfirmed?: boolean;
+  buyerConfirmed?: boolean;
+
+  // comm threads για να τα κλειδώνουμε όλα
+  commThreadIds?: string[];
+};
 
 /* =========================================================
-   Labels
+   Simple utils
 ========================================================= */
-const LABELS: Record<Kind, { title: string; color: number }> = {
-  sell: { title: 'Πώληση / Sell', color: 0x2ecc71 },
-  buy : { title: 'Αγορά / Buy',   color: 0x3498db },
-}
 
-/* =========================================================
-   ENV accessor
-========================================================= */
-function env(name: string): string {
-  const v = process.env[name]
-  if (!v) throw new Error(`Missing env: ${name}`)
-  return v
-}
-
-/* =========================================================
-   Id helper
-========================================================= */
-function newId(): string {
-  return Math.random().toString(36).slice(2, 10)
-}
-
-/* =========================================================
-   Disable controls helper (μην τροποποιείς readonly .components)
-========================================================= */
-async function disableControls(message: any) {
-  try {
-    const newRows = (message.components || []).map((r: any) => {
-      const row = new ActionRowBuilder<ButtonBuilder>()
-      const comps = (r.components || []).map((c: any) => ButtonBuilder.from(c).setDisabled(true))
-      row.addComponents(...comps)
-      return row
-    })
-    await message.edit({ components: newRows })
-  } catch (e) {
-    console.error('disableControls error:', e)
-  }
-}
-
-/* =========================================================
-   Export commands
-========================================================= */
-export function getMarketCommands() {
-  return [
-    new SlashCommandBuilder()
-      .setName('market')
-      .setDescription('Marketplace tools')
-      .addSubcommand((sc) =>
-        sc
-          .setName('post')
-          .setDescription('Create a buy/sell post (goes to CASE thread for approval)')
-          .addStringOption((o) =>
-            o
-              .setName('type')
-              .setDescription('Type of post')
-              .setRequired(true)
-              .addChoices(
-                { name: 'Πώληση / Sell', value: 'sell' },
-                { name: 'Αγορά / Buy',   value: 'buy'  },
-              ),
-          )
-          .addAttachmentOption((o) =>
-            o.setName('photo1').setDescription('1η φωτογραφία').setRequired(true),
-          )
-          .addAttachmentOption((o) =>
-            o.setName('photo2').setDescription('2η φωτογραφία (optional)').setRequired(false),
-          ),
-      ),
-  ]
-}
-
-/* =========================================================
-   Paths / JSON helpers (approved/deals/rep)
-========================================================= */
-const DATA_DIR = path.resolve('./data')
+const DATA_DIR = path.join(process.cwd(), 'data');
 const FILES = {
-  approved: path.join(DATA_DIR, 'approvedPosts.json'),
-  deals   : path.join(DATA_DIR, 'deals.json'),
-  rep     : path.join(DATA_DIR, 'reputation.json'),
-}
+  approvals: path.join(DATA_DIR, 'approvedPosts.json'),
+};
 
-function ensureFiles() {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true })
-  if (!fs.existsSync(FILES.approved)) fs.writeFileSync(FILES.approved, '[]')
-  if (!fs.existsSync(FILES.deals)) fs.writeFileSync(FILES.deals, '{}')
-  if (!fs.existsSync(FILES.rep)) fs.writeFileSync(FILES.rep, '{}')
+function ensureDataDir() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 }
-
-function readJSON<T = any>(file: string): T {
+function readJson<T>(f: string, fallback: T): T {
   try {
-    ensureFiles()
-    return JSON.parse(fs.readFileSync(file, 'utf8')) as T
+    ensureDataDir();
+    if (!fs.existsSync(f)) return fallback;
+    const raw = fs.readFileSync(f, 'utf-8');
+    return JSON.parse(raw) as T;
   } catch {
-    return (file === FILES.approved ? [] : {}) as T
+    return fallback;
   }
 }
-function writeJSON(file: string, data: unknown) {
-  try {
-    ensureFiles()
-    fs.writeFileSync(file, JSON.stringify(data, null, 2))
-  } catch (e) {
-    console.error('writeJSON error', file, e)
-  }
+function writeJsonAtomic(f: string, data: any) {
+  ensureDataDir();
+  const tmp = `${f}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+  fs.renameSync(tmp, f);
+}
+function newId(): string {
+  return Math.random().toString(36).slice(2, 10);
+}
+function env(name: string): string {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env ${name}`);
+  return v;
+}
+function isMod(member: GuildMember | null | undefined): boolean {
+  return !!member?.permissions?.has(PermissionFlagsBits.ManageGuild);
 }
 
-function saveApprovedPost(post: any) {
-  const arr = readJSON<any[]>(FILES.approved)
-  arr.push(post)
-  writeJSON(FILES.approved, arr)
-}
-function getDeal(pid: string) {
-  const m = readJSON<Record<string, any>>(FILES.deals)
-  return m[pid] || null
-}
-function upsertDeal(pid: string, dealObj: Record<string, any>) {
-  const m = readJSON<Record<string, any>>(FILES.deals)
-  m[pid] = { ...(m[pid] || {}), ...dealObj }
-  writeJSON(FILES.deals, m)
-}
-function addReputation(userId: string, role: 'seller' | 'buyer') {
-  const rep = readJSON<Record<string, any>>(FILES.rep)
-  const cur = rep[userId] || { total: 0, asSeller: 0, asBuyer: 0 }
-  cur.total += 1
-  if (role === 'seller') cur.asSeller += 1
-  else cur.asBuyer += 1
-  rep[userId] = cur
-  writeJSON(FILES.rep, rep)
+// ✅ helper: φτιάχνει images[] από photo1/photo2
+function photosToImages(...photos: Array<{ url: string } | null | undefined>): string[] {
+  return photos.map(p => p?.url).filter(Boolean) as string[];
 }
 
 /* =========================================================
-   Helpers
+   In-memory pending (slash→modal / approvals)
 ========================================================= */
-function isMemberMod(member: GuildMember | null): boolean {
-  if (!member) return false
-  const modRoleId = process.env.MOD_ROLE_ID
-  const hasRole = modRoleId ? member.roles.cache.has(modRoleId) : false
-  const hasPerm =
-    member.permissions.has(PermissionFlagsBits.ManageMessages) ||
-    member.permissions.has(PermissionFlagsBits.ManageThreads)
-  return hasRole || hasPerm
-}
+
+const pendingSlashToModal = new Map<string, PendingSlash>();
+const pendingApprovals = new Map<string, PendingApproval>();
 
 /* =========================================================
-   Handler
+   Slash command
 ========================================================= */
-export async function handleMarketCommand(interaction: Interaction) {
-  if (!interaction.guild) return
 
-  // ----- Slash: /market post -----
-  if (interaction.isChatInputCommand() && interaction.commandName === 'market') {
-    const sub = interaction.options.getSubcommand()
-    if (sub !== 'post') return
-
-    const member = await interaction.guild.members.fetch(interaction.user.id)
-    const canPost = true
-    if (!canPost) {
-      return interaction.reply({
-        content: '⛔ Δεν έχεις δικαίωμα για /market post.',
-        flags: MessageFlags.Ephemeral,
-      })
-    }
-
-    try {
-      const kind = interaction.options.getString('type', true) as Kind
-      const photo1 = interaction.options.getAttachment('photo1')
-      const photo2 = interaction.options.getAttachment('photo2') || null
-
-      // persist προσωρινά
-      const slashPayload: PendingSlash = {
-        userId: interaction.user.id,
-        kind,
-        photo1: photo1 as any,
-        photo2: (photo2 as any) || null,
-        createdAt: Date.now(),
-      }
-      await setSlash(slashPayload)
-
-      const modal = new ModalBuilder().setCustomId('marketPost').setTitle('Δημιουργία Αγγελίας')
-
-      const card = new TextInputBuilder()
-        .setCustomId('cardName')
-        .setLabel('Όνομα Κάρτας')
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true)
-
-      const location = new TextInputBuilder()
-        .setCustomId('location')
-        .setLabel('Περιοχή / Παράδοση')
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true)
-
-      const quantity = new TextInputBuilder()
-        .setCustomId('quantity')
-        .setLabel('Ποσότητα')
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true)
-
-      const price = new TextInputBuilder()
-        .setCustomId('price')
-        .setLabel('Τιμή (SELL) ή Budget (BUY)')
-        .setStyle(TextInputStyle.Short)
-        .setRequired(false)
-
-      const extra = new TextInputBuilder()
-        .setCustomId('extra')
-        .setLabel('Extra πληροφορίες')
-        .setStyle(TextInputStyle.Paragraph)
-        .setRequired(false)
-
-      modal.addComponents(
-        new ActionRowBuilder<TextInputBuilder>().addComponents(card),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(location),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(quantity),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(price),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(extra),
-      )
-
-      return interaction.showModal(modal)
-    } catch (e) {
-      console.error('slash market post error', e)
-      return interaction.reply({
-        content: '❌ Κάτι πήγε στραβά.',
-        flags: MessageFlags.Ephemeral,
-      })
-    }
-  }
-
-  // ----- Modal submit: collect details & create CASE -----
-  if (interaction.isModalSubmit() && interaction.customId === 'marketPost') {
-    try {
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral })
-
-      const s = getSlash(interaction.user.id)
-      await deleteSlash(interaction.user.id)
-      if (!s)
-        return interaction.editReply('❌ Δεν βρέθηκαν τα αρχικά στοιχεία. Ξαναδοκίμασε το `/market post`.')
-
-      const { kind, photo1, photo2 } = s
-
-      const cardName = interaction.fields.getTextInputValue('cardName')?.trim()
-      const location = interaction.fields.getTextInputValue('location')?.trim()
-      const quantityRaw = interaction.fields.getTextInputValue('quantity')?.trim()
-      const priceRaw = interaction.fields.getTextInputValue('price')?.trim()
-      const extra = interaction.fields.getTextInputValue('extra')?.trim() || '-'
-
-      const isSell = kind === 'sell'
-      const quantity = Math.max(1, Number(quantityRaw || '1'))
-      const price = priceRaw ? Number(priceRaw.replace(',', '.')) : null
-      if (isSell && (!Number.isFinite(price) || (price as number) <= 0)) {
-        return interaction.editReply('⚠️ Για SELL απαιτείται τιμή (>0).')
-      }
-
-      const { title, color } = LABELS[kind]
-
-      const preview = new EmbedBuilder()
-        .setTitle(`[PREVIEW] ${title} — ${cardName}`)
-        .addFields(
-          { name: 'Ποσότητα', value: quantity.toString(), inline: true },
-          { name: isSell ? 'Τιμή' : 'Budget', value: (price ?? '-') + (price ? '€' : ''), inline: true },
-          { name: 'Περιοχή / Παράδοση', value: location || '-', inline: true },
-          { name: 'Extra', value: extra },
+export function getMarketCommands() {
+  const post = new SlashCommandBuilder()
+    .setName('market')
+    .setDescription('Δημιούργησε αγγελία αγοράς/πώλησης')
+    .addSubcommand((s) =>
+      s
+        .setName('post')
+        .setDescription('Νέα αγγελία')
+        .addStringOption((o) =>
+          o
+            .setName('kind')
+            .setDescription('Είδος αγγελίας')
+            .setRequired(true)
+            .addChoices(
+              { name: 'Sell', value: 'sell' },
+              { name: 'Buy', value: 'buy' },
+            ),
         )
-        .setColor(color)
-        .setFooter({ text: `Υποβλήθηκε από ${interaction.user.tag} • ${interaction.user.id}` })
-
-      if (photo1) preview.setImage((photo1 as any).url)
-      if (photo2) preview.addFields({ name: 'Επιπλέον φωτό', value: (photo2 as any).url })
-
-      const LOG_ID = env('MARKET_LOG_CHANNEL_ID')
-      const logChannel: any = interaction.guild?.channels.cache.get(LOG_ID)
-      if (!logChannel) return interaction.editReply('⚠️ Δεν βρέθηκε MARKET_LOG_CHANNEL_ID στο .env.')
-
-      const stub = await logChannel.send(
-        `🧾 Case for **${cardName}** από <@${interaction.user.id}> (${kind.toUpperCase()})`,
-      )
-      const caseThread = await stub.startThread({
-        name: `CASE • ${cardName} — ${interaction.user.username}`,
-        autoArchiveDuration: 10080,
-        type: ChannelType.PrivateThread,
-      })
-
-      const pid = newId()
-
-      const reviewRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder().setCustomId(`approve:${pid}`).setLabel('Approve ✅').setStyle(ButtonStyle.Success),
-        new ButtonBuilder().setCustomId(`reject:${pid}`).setLabel('Reject ❌').setStyle(ButtonStyle.Danger),
-      )
-      const caseMsg = await caseThread.send({
-        content: `📝 **Νέα αγγελία προς έγκριση** από <@${interaction.user.id}> (${kind.toUpperCase()})`,
-        embeds: [preview],
-        components: [reviewRow],
-      })
-
-      const modChannel: any = interaction.guild?.channels.cache.get(process.env.MOD_CHANNEL_ID!)
-      modChannel?.send(`📝 Νέα αγγελία → ελέγξτε το CASE: ${caseThread.toString()}`)
-
-      const approval: PendingApproval = {
-        pid,
-        guildId: interaction.guildId!,
-        requesterId: interaction.user.id,
-        kind,
-        cardName,
-        quantity,
-        price,
-        location,
-        extra,
-        photo1: photo1 as any,
-        photo2: (photo2 as any) || null,
-        caseThreadId: caseThread.id,
-        caseMessageId: caseMsg.id,
-        createdAt: Date.now(),
-        contacts: [],
-      }
-      await setApproval(approval)
-
-      return interaction.editReply(
-        `✅ Δημιουργήθηκε CASE thread για έγκριση: ${caseThread.toString()} (PID: \`${pid}\`)`,
-      )
-    } catch (e) {
-      console.error('modal marketPost error', e)
-      return interaction.editReply('❌ Σφάλμα κατά τη δημιουργία του CASE.')
-    }
-  }
-
-  // ----- Buttons -----
-  if (interaction.isButton()) {
-    const [action, pid] = interaction.customId.split(':')
-    if (
-      !['approve', 'reject', 'contact', 'close', 'complete', 'modresolve'].includes(action) ||
-      !pid
+        .addAttachmentOption((o) =>
+          o.setName('photo1').setDescription('Φωτογραφία 1').setRequired(true), // ✅ required
+        )
+        .addAttachmentOption((o) =>
+          o.setName('photo2').setDescription('Φωτογραφία 2').setRequired(false),
+        ),
     )
-      return
+    .setDefaultMemberPermissions(PermissionFlagsBits.SendMessages);
 
-    if (action !== 'modresolve') {
-      try { await interaction.deferUpdate() } catch {}
+  return [post];
+}
+
+/* =========================================================
+   Register interactions
+========================================================= */
+
+export function registerMarketInteractions(client: Client) {
+  client.on('interactionCreate', async (interaction: Interaction) => {
+    // ----- Slash /market post → show modal -----
+    if (interaction.isChatInputCommand() && interaction.commandName === 'market') {
+      const sub = interaction.options.getSubcommand();
+      if (sub === 'post') {
+        const kind = interaction.options.getString('kind', true) as Kind;
+        const photo1 = interaction.options.getAttachment('photo1');
+        const photo2 = interaction.options.getAttachment('photo2');
+
+        // κρατάμε προσωρινά μέχρι το modal submit
+        pendingSlashToModal.set(interaction.user.id, { kind, photo1, photo2 });
+
+        const modal = new ModalBuilder().setCustomId('marketPost').setTitle('Νέα αγγελία');
+        const card = new TextInputBuilder()
+          .setCustomId('cardName')
+          .setLabel('Όνομα Κάρτας')
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true);
+        const location = new TextInputBuilder()
+          .setCustomId('location')
+          .setLabel('Περιοχή')
+          .setStyle(TextInputStyle.Short)
+          .setRequired(false);
+        const quantity = new TextInputBuilder()
+          .setCustomId('quantity')
+          .setLabel('Ποσότητα')
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true);
+        const price = new TextInputBuilder()
+          .setCustomId('price')
+          .setLabel('Τιμή (ή Budget αν BUY)')
+          .setStyle(TextInputStyle.Short)
+          .setRequired(true); // ✅ required
+        const extra = new TextInputBuilder()
+          .setCustomId('extra')
+          .setLabel('Extra πληροφορίες (π.χ. Τρόπος Παράδοσης)')
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(false);
+
+        modal.addComponents(
+          new ActionRowBuilder<TextInputBuilder>().addComponents(card),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(location),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(quantity),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(price),
+          new ActionRowBuilder<TextInputBuilder>().addComponents(extra),
+        );
+
+        await interaction.showModal(modal);
+      }
+      return;
     }
 
-    const member = await interaction.guild!.members.fetch(interaction.user.id)
-    const modPerm = isMemberMod(member)
-
-    const payload = getApproval(pid)
-
-    // -------- Approve --------
-    if (action === 'approve') {
-      if (!payload)
-        return interaction.followUp({ content: '❌ Δεν βρέθηκαν στοιχεία αυτής της αίτησης.', flags: MessageFlags.Ephemeral })
-
-      const { kind, cardName, quantity, price, location, extra, photo1, photo2, requesterId, caseThreadId, caseMessageId } =
-        payload
-      const isSell = kind === 'sell'
-      const { title: typeLabel, color } = LABELS[kind]
-
-      const priceText = Number.isFinite(price as number) ? `${price}€` : '-'
-      const publicEmbed = new EmbedBuilder()
-        .setTitle(`${typeLabel} — ${cardName}`)
-        .addFields(
-          { name: 'Ποσότητα', value: quantity.toString(), inline: true },
-          { name: isSell ? 'Τιμή' : 'Budget', value: priceText, inline: true },
-          { name: 'Περιοχή / Παράδοση', value: location || '-', inline: true },
-          { name: 'Extra', value: extra || '-' },
-        )
-        .setColor(color)
-        .setFooter({ text: `Από ${interaction.guild!.members.cache.get(requesterId)?.user?.tag || requesterId}` })
-        .setTimestamp(new Date())
-
-      if (photo1) publicEmbed.setImage((photo1 as any).url)
-      if (photo2) publicEmbed.addFields({ name: 'Επιπλέον φωτό', value: (photo2 as any).url })
-
-      const targetId = isSell ? process.env.SELL_CHANNEL_ID : process.env.BUY_CHANNEL_ID
-      const targetChannel: any = interaction.guild!.channels.cache.get(targetId!)
-      if (!targetId || !targetChannel) {
-        console.error('Approve error: target channel missing', { kind, targetId })
-        return interaction.followUp({ content: '⚠️ Δεν βρέθηκε το κανάλι στόχος (SELL/BUY).', flags: MessageFlags.Ephemeral })
-      }
-
-      const me = targetChannel.guild.members.me
-      const need = [
-        PermissionFlagsBits.ViewChannel,
-        PermissionFlagsBits.SendMessages,
-        PermissionFlagsBits.EmbedLinks,
-        PermissionFlagsBits.AttachFiles,
-      ]
-      const missing = need.filter((p) => !targetChannel.permissionsFor(me)?.has(p))
-      if (missing.length) {
-        console.error('Approve missing perms:', missing)
-        return interaction.followUp({ content: '⛔ Το bot δεν έχει δικαιώματα στο BUY/SELL (View/Send/Embed/Attach).', flags: MessageFlags.Ephemeral })
-      }
-
-      const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder().setCustomId(`contact:${pid}`).setLabel('Ενδιαφέρομαι 🙋').setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId(`close:${pid}`).setLabel('Κλείσιμο Αγγελίας 🔒').setStyle(ButtonStyle.Secondary),
-      )
-
-      let postMsg: any
+    // ----- Modal submit → CASE thread με summary + κουμπιά -----
+    if (interaction.isModalSubmit() && interaction.customId === 'marketPost') {
       try {
-        postMsg = await targetChannel.send({ embeds: [publicEmbed], components: [row] })
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+        const saved = pendingSlashToModal.get(interaction.user.id);
+        pendingSlashToModal.delete(interaction.user.id);
+        if (!saved)
+          return interaction.editReply('❌ Δεν βρέθηκαν τα αρχικά στοιχεία. Ξαναδοκίμασε το `/market post`.');
+
+        const { kind, photo1, photo2 } = saved as { kind: Kind; photo1: any; photo2: any };
+
+        const cardName = interaction.fields.getTextInputValue('cardName').trim();
+        const location = interaction.fields.getTextInputValue('location').trim();
+        const quantity = Number(interaction.fields.getTextInputValue('quantity'));
+        const priceParsed = interaction.fields.getTextInputValue('price').trim();
+        const price = priceParsed ? Number(priceParsed.replace(',', '.')) : null;
+        const extra = interaction.fields.getTextInputValue('extra').trim();
+        const requesterId = interaction.user.id;
+
+        const LOG_ID = env('MARKET_LOG_CHANNEL_ID');
+        const logChannel: any = interaction.guild?.channels.cache.get(LOG_ID);
+        if (!logChannel) return interaction.editReply('⚠️ Δεν βρέθηκε MARKET_LOG_CHANNEL_ID στο .env.');
+
+        const stub = await logChannel.send(
+          `🧾 Case for **${cardName}** από <@${interaction.user.id}> (${kind.toUpperCase()})`,
+        );
+        const caseThread = await stub.startThread({
+          name: `CASE • ${cardName} — ${interaction.user.username}`,
+          autoArchiveDuration: 10080,
+          type: ChannelType.PrivateThread,
+        });
+
+        const pid = newId();
+
+        // CASE summary (PENDING) + pin
+        const caseMsg = await caseThread.send({
+          content: `📝 **Νέα αγγελία προς έγκριση** από <@${interaction.user.id}> (${kind.toUpperCase()})`,
+          embeds: [
+            buildCaseSummaryEmbed({
+              approval: {
+                pid,
+                kind,
+                title: cardName,
+                quantity: quantity ?? undefined,
+                price: price ?? undefined,
+                location: location ?? undefined,
+                extra: extra ?? undefined,
+                requesterId,
+                // ✅ δώσε εικόνες στο embed (1η θα φανεί, 2η ως link)
+                images: photosToImages(
+                  photo1 ? { url: photo1.url } : null,
+                  photo2 ? { url: photo2.url } : null
+                ),
+              } as any,
+              status: 'pending',
+              sellerId: requesterId,
+              buyerId: undefined,
+              contacts: [],
+            }),
+          ],
+          components: [buildCaseReviewRow(pid)],
+        });
+        caseMsg.pin().catch(() => void 0);
+
+        pendingApprovals.set(pid, {
+          pid,
+          kind,
+          cardName,
+          price,
+          quantity,
+          location,
+          extra,
+          photo1: photo1 ? { url: photo1.url } : null,
+          photo2: photo2 ? { url: photo2.url } : null,
+          caseThreadId: caseThread.id,
+          caseMessageId: caseMsg.id,
+          contacts: new Set<string>(),
+          requesterId,
+          status: 'pending',
+          commThreadIds: [],
+        });
+
+        return interaction.editReply(`📌 Δημιουργήθηκε CASE για **${cardName}** (pid=${pid}).`);
       } catch (e) {
-        console.error('Approve send error:', e)
-        try {
-          const caseThread: any = interaction.guild!.channels.cache.get(caseThreadId)
-          const caseMsg: any = await caseThread?.messages.fetch(caseMessageId).catch(() => null)
-          if (caseMsg) await disableControls(caseMsg)
-          caseThread?.send(`❌ Αποτυχία δημοσίευσης στο <#${targetId}>.`)
-        } catch {}
-        return interaction.followUp({ content: '❌ Σφάλμα κατά τη δημοσίευση.', flags: MessageFlags.Ephemeral })
+        console.error('modal submit error', e);
+        return interaction.editReply('❌ Κάτι πήγε στραβά.');
       }
-
-      await setApproval({
-        ...payload,
-        postedMessageId: postMsg.id,
-        postedChannelId: targetChannel.id,
-        contacts: payload.contacts || [],
-      })
-
-      saveApprovedPost({
-        pid,
-        guildId: interaction.guildId,
-        channelId: targetChannel.id,
-        messageId: postMsg.id,
-        requesterId,
-        kind,
-        cardName,
-        quantity,
-        price,
-        location,
-        extra,
-        timestamp: new Date().toISOString(),
-      })
-
-      // Disable Approve/Reject στο CASE + προσθήκη Mod Resolve control
-      try {
-        const caseThread: any = interaction.guild!.channels.cache.get(caseThreadId)
-        const caseMsg: any = await caseThread?.messages.fetch(caseMessageId).catch(() => null)
-        if (caseMsg) {
-          const newRows = (caseMsg.components || []).map((r: any) => {
-            const row = new ActionRowBuilder<ButtonBuilder>()
-            const comps = (r.components || []).map((c: any) => ButtonBuilder.from(c).setDisabled(true))
-            row.addComponents(...comps)
-            return row
-          })
-          await caseMsg.edit({ components: newRows })
-
-          const modRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-            new ButtonBuilder().setCustomId(`modresolve:${pid}`).setLabel('Mod Resolve 🛡️').setStyle(ButtonStyle.Secondary),
-          )
-          await caseThread.send({ content: 'Controls (mods only):', components: [modRow] })
-          await caseThread.send(`✅ Εγκρίθηκε από ${interaction.user}. Δημοσιεύτηκε στο <#${targetId}> (msg: ${postMsg.id}).`)
-        }
-      } catch {}
-
-      return interaction.followUp({ content: `✅ Δημοσιεύτηκε στο <#${targetId}>.`, flags: MessageFlags.Ephemeral })
     }
 
-    // -------- Reject --------
+    // ----- Button handlers -----
+    if (!interaction.isButton()) return;
+    const [action, pid] = interaction.customId.split(':');
+
+    // helper: φέρνει το CASE μήνυμα & κάνει refresh embed
+    async function refreshCaseSummary(p: PendingApproval) {
+      try {
+        const caseThread: any = interaction.guild!.channels.cache.get(p.caseThreadId);
+        const caseMessage = await caseThread?.messages.fetch(p.caseMessageId);
+        if (!caseMessage) return;
+
+        const embed = buildCaseSummaryEmbed({
+          approval: {
+            pid: p.pid,
+            kind: p.kind,
+            title: p.cardName,
+            quantity: p.quantity ?? undefined,
+            price: p.price ?? undefined,
+            location: p.location ?? undefined,
+            extra: p.extra ?? undefined,
+            requesterId: p.requesterId,
+            // ✅ κράτα εικόνες και στο refresh
+            images: photosToImages(p.photo1 ?? null, p.photo2 ?? null),
+          } as any,
+          status: (p.status ?? 'pending') as CaseStatus,
+          sellerId: p.requesterId,
+          buyerId: p.buyerId,
+          sellerConfirmed: !!p.sellerConfirmed,
+          buyerConfirmed: !!p.buyerConfirmed,
+          contacts: Array.from(p.contacts ?? []),
+        });
+
+        const changedComponents =
+          (p.status && p.status !== 'pending')
+            ? [buildCaseReviewRow(p.pid, { disableApproveReject: true, modResolveEnabled: true })]
+            : [buildCaseReviewRow(p.pid, { disableApproveReject: false, modResolveEnabled: true })];
+
+        await caseMessage.edit({
+          embeds: [embed],
+          components: changedComponents,
+        });
+      } catch (e) {
+        console.error('refreshCaseSummary error', e);
+      }
+    }
+
+    // --- Approve ---
+    if (action === 'approve') {
+      try {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+        const payload = pendingApprovals.get(pid);
+        if (!payload) return interaction.editReply('❌ Το CASE δεν βρέθηκε.');
+
+        const member = interaction.member as GuildMember;
+        if (!isMod(member))
+          return interaction.editReply('⛔ Μόνο mods μπορούν να κάνουν approve.');
+
+        const isSell = payload.kind === 'sell';
+        const { kind, price, quantity, cardName, location, extra, requesterId, photo1, photo2 } = payload;
+
+        const publicEmbed = buildPublicPostEmbed({
+          approval: {
+            pid,
+            kind,
+            title: cardName,
+            quantity: quantity ?? undefined,
+            price: price ?? undefined,
+            location: location ?? undefined,
+            extra: extra ?? undefined,
+            requesterId,
+          },
+        });
+
+        // Public εικόνες: 1η στο embed, 2η ως link
+        if (photo1) publicEmbed.setImage(photo1.url);
+        if (photo2) publicEmbed.addFields({ name: 'Επιπλέον φωτό', value: photo2.url });
+
+        const targetId = isSell ? env('SELL_CHANNEL_ID') : env('BUY_CHANNEL_ID');
+        const targetChannel: any = interaction.guild!.channels.cache.get(targetId!);
+        if (!targetId || !targetChannel) {
+          console.error('Approve error: target channel missing', { kind, targetId });
+          return interaction.editReply('⚠️ Δεν βρέθηκε target κανάλι.');
+        }
+
+        // ✅ Public button ENABLED μετά το approve
+        const row = buildPublicPostRow(true, pid);
+        const postMsg = await targetChannel.send({ embeds: [publicEmbed], components: [row] });
+
+        // update state
+        payload.postedMessageId = postMsg.id;
+        payload.postedChannelId = targetChannel.id;
+        payload.status = 'open';
+        pendingApprovals.set(pid, payload);
+
+        saveApprovedPost({
+          pid,
+          guildId: interaction.guildId ?? undefined,
+          channelId: targetChannel.id,
+          messageId: postMsg.id,
+        });
+
+        // refresh CASE: disable AR + keep Mod Resolve enabled
+        await refreshCaseSummary(payload);
+
+        return interaction.editReply(`✅ Δημοσιεύτηκε στο ${targetChannel.toString()}.`);
+      } catch (e) {
+        console.error('approve error', e);
+        return interaction.editReply('❌ Κάτι πήγε στραβά στο approve.');
+      }
+    }
+
+    // --- Reject ---
     if (action === 'reject') {
-      if (!modPerm)
-        return interaction.followUp({ content: '⛔ Μόνο mods.', flags: MessageFlags.Ephemeral })
-      if (!payload)
-        return interaction.followUp({ content: '❌ Δεν βρέθηκαν στοιχεία.', flags: MessageFlags.Ephemeral })
-
-      const { caseThreadId, caseMessageId, cardName } = payload
-      await deleteApproval(pid)
-
       try {
-        const caseThread: any = interaction.guild!.channels.cache.get(caseThreadId)
-        const caseMsg: any = await caseThread?.messages.fetch(caseMessageId).catch(() => null)
-        if (caseMsg) {
-          const newRows = (caseMsg.components || []).map((r: any) => {
-            const row = new ActionRowBuilder<ButtonBuilder>()
-            const comps = (r.components || []).map((c: any) => ButtonBuilder.from(c).setDisabled(true))
-            row.addComponents(...comps)
-            return row
-          })
-          await caseMsg.edit({ components: newRows })
-          caseThread?.send(`❌ Απορρίφθηκε από ${interaction.user}. (PID: ${pid}, Card: **${cardName}**)`)
-        }
-      } catch {}
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-      return interaction.followUp({ content: '❌ Απορρίφθηκε η αγγελία.', flags: MessageFlags.Ephemeral })
+        const payload = pendingApprovals.get(pid);
+        if (!payload) return interaction.editReply('❌ Το CASE δεν βρέθηκε.');
+
+        const member = interaction.member as GuildMember;
+        if (!isMod(member))
+          return interaction.editReply('⛔ Μόνο mods μπορούν να απορρίψουν.');
+
+        const caseThread: any = interaction.guild!.channels.cache.get(payload.caseThreadId);
+        caseThread?.send(`❌ Απορρίφθηκε από ${interaction.user}.`);
+        return interaction.editReply('⛔ Απορρίφθηκε.');
+      } catch (e) {
+        console.error('reject error', e);
+        return interaction.editReply('❌ Κάτι πήγε στραβά στο reject.');
+      }
     }
 
-    // -------- Contact (open comm thread) --------
+    // --- Contact ("Ενδιαφέρομαι") ---
     if (action === 'contact') {
-      if (!payload)
-        return interaction.followUp({ content: '❌ Δεν βρέθηκε η αγγελία.', flags: MessageFlags.Ephemeral })
-
-      if (payload.contacts?.includes(interaction.user.id)) {
-        return interaction.followUp({ content: 'ℹ️ Υπάρχει ήδη συζήτηση για σένα σε αυτή την αγγελία.', flags: MessageFlags.Ephemeral })
-      }
-
-      if (!payload.postedChannelId || !payload.postedMessageId) {
-        return interaction.followUp({ content: '❌ Δεν βρέθηκαν ids δημοσίευσης για την αγγελία.', flags: MessageFlags.Ephemeral })
-      }
-
-      const channel: any = interaction.guild!.channels.cache.get(payload.postedChannelId!)
-      const message = await channel?.messages.fetch(payload.postedMessageId!).catch(() => null)
-      if (!message) {
-        return interaction.followUp({ content: '⚠️ Το αρχικό μήνυμα δεν βρέθηκε.', flags: MessageFlags.Ephemeral })
-      }
-
-      const threadName = `📦 ${payload.cardName} — ${interaction.user.username}`
-      const me = channel.guild.members.me
-      const canPrivate = channel
-        .permissionsFor(me)
-        ?.has([PermissionFlagsBits.CreatePrivateThreads, PermissionFlagsBits.SendMessagesInThreads])
-
-      const commThread = await message.startThread({
-        name: threadName,
-        autoArchiveDuration: 10080,
-        type: canPrivate ? ChannelType.PrivateThread : ChannelType.PublicThread,
-      })
-
-      await commThread.members.add(payload.requesterId).catch(() => {})
-      await commThread.members.add(interaction.user.id).catch(() => {})
-
-      const newContacts = Array.from(new Set([...(payload.contacts || []), interaction.user.id]))
-      await setApproval({ ...payload, contacts: newContacts })
-
-      await commThread.send(
-        `Γεια σας <@${payload.requesterId}> & <@${interaction.user.id}>!\n` +
-          `• **Κάρτα:** ${payload.cardName}\n` +
-          `• **Ποσότητα:** ${payload.quantity}\n` +
-          (Number.isFinite(payload.price as number) ? `• **Τιμή/Budget:** ${payload.price}€\n` : '') +
-          `• **Περιοχή/Παράδοση:** ${payload.location || '-'}\n\n` +
-          `Όταν ολοκληρωθεί η συναλλαγή, πατήστε το κουμπί **Ολοκληρώθηκε ✅** (χρειάζονται 2 επιβεβαιώσεις σε 72h).`,
-      )
-
-      const controls = new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder().setCustomId(`complete:${pid}`).setLabel('Ολοκληρώθηκε ✅').setStyle(ButtonStyle.Success),
-      )
-      const controlsMsg = await commThread.send({ content: `Controls:`, components: [controls] })
-
-      upsertDeal(pid, {
-        pid,
-        threadId: commThread.id,
-        sellerId: payload.requesterId,
-        buyerId: interaction.user.id,
-        status: 'pending',
-        firstConfirmBy: null,
-        firstConfirmAt: null,
-        caseThreadId: payload.caseThreadId,
-        controlsMessageId: controlsMsg.id,
-        createdAt: Date.now(),
-      })
-
-      return interaction.followUp({ content: '✅ Δημιουργήθηκε private thread επικοινωνίας.', flags: MessageFlags.Ephemeral })
-    }
-
-    // -------- Complete (double confirm, 72h) --------
-    if (action === 'complete') {
-      const deal = getDeal(pid)
-      if (!deal)
-        return interaction.followUp({ content: '❌ Δεν βρέθηκαν στοιχεία συναλλαγής.', flags: MessageFlags.Ephemeral })
-
-      if (deal.status !== 'pending') {
-        return interaction.followUp({ content: `ℹ️ Το deal είναι ήδη **${deal.status}**.`, flags: MessageFlags.Ephemeral })
-      }
-
-      const now = Date.now()
-      const isSeller = interaction.user.id === deal.sellerId
-      const isBuyer  = interaction.user.id === deal.buyerId
-      if (!isSeller && !isBuyer) {
-        return interaction.followUp({ content: '⛔ Μόνο seller ή buyer.', flags: MessageFlags.Ephemeral })
-      }
-
-      const commThread: any = interaction.channel?.isThread() ? interaction.channel : null
-      const caseThread: any = deal.caseThreadId ? interaction.guild!.channels.cache.get(deal.caseThreadId) : null
-
-      if (!deal.firstConfirmBy) {
-        upsertDeal(pid, { firstConfirmBy: interaction.user.id, firstConfirmAt: now })
-        await commThread?.send(`✅ 1η επιβεβαίωση από ${interaction.user}. Περιμένουμε τη 2η επιβεβαίωση (72h).`)
-        await caseThread?.send(`ℹ️ 1η επιβεβαίωση στο deal από ${interaction.user} (PID: ${pid}).`)
-        return interaction.followUp({ content: '👍 Καταχωρήθηκε η 1η επιβεβαίωση. Χρειάζεται άλλη μία σε 72h.', flags: MessageFlags.Ephemeral })
-      }
-
-      const within = now - (deal.firstConfirmAt || 0)
-      const within72h = within <= 72 * 60 * 60 * 1000
-      if (!within72h) {
-        upsertDeal(pid, { status: 'expired' })
-        await commThread?.send('⌛ Έληξε το παράθυρο 72h χωρίς 2η επιβεβαίωση. Το deal δεν μετράει στο rep.')
-        await caseThread?.send('⌛ Έληξε χωρίς 2η επιβεβαίωση (no rep).')
-        return interaction.followUp({ content: '⌛ Έληξε το παράθυρο 72h. Το deal μαρκάρεται ως expired.', flags: MessageFlags.Ephemeral })
-      }
-
-      upsertDeal(pid, { status: 'completed' })
-      addReputation(deal.sellerId, 'seller')
-      addReputation(deal.buyerId, 'buyer')
-
       try {
-        const controlsMsg = await commThread?.messages.fetch(deal.controlsMessageId).catch(() => null)
-        if (controlsMsg) await disableControls(controlsMsg)
-        await commThread?.send('🏁 Ολοκληρώθηκε. Το thread θα αρχειοθετηθεί.')
-        await commThread?.setArchived(true).catch(() => {})
-        await caseThread?.send('🏁 Ολοκληρώθηκε (rep +1 σε seller & buyer).')
-      } catch {}
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-      return interaction.followUp({ content: '✅ Ολοκληρώθηκε το deal (rep +1).', flags: MessageFlags.Ephemeral })
+        const p = pendingApprovals.get(pid);
+        if (!p) return interaction.editReply('❌ Η αγγελία δεν βρέθηκε.');
+
+        const member = interaction.member as GuildMember;
+        const uid = interaction.user.id;
+
+        // Self-interest block (εκτός αν mod)
+        if (uid === p.requesterId && !isMod(member)) {
+          return interaction.editReply('🙅 Δεν μπορείς να ενδιαφερθείς στη **δική σου** αγγελία.');
+        }
+
+        // Πρέπει να υπάρχει δημοσιευμένο μήνυμα
+        if (!p.postedChannelId || !p.postedMessageId) {
+          return interaction.editReply('⚠️ Δεν έχει δημοσιευτεί ακόμη το public post.');
+        }
+        const channel: any = interaction.guild!.channels.cache.get(p.postedChannelId);
+        const postMessage = await channel.messages.fetch(p.postedMessageId);
+
+        // ✅ PRIVATE thread (ΟΧΙ message.startThread αν γίνεται)
+        let thread: ThreadChannel;
+        try {
+          thread = await channel.threads.create({
+            name: `deal • ${p.cardName} — ${interaction.user.username}`,
+            autoArchiveDuration: 1440,
+            type: ChannelType.PrivateThread,
+            reason: `Private deal thread for PID ${p.pid}`,
+          });
+        } catch {
+          // Fallback: public thread πάνω στο μήνυμα
+          thread = await postMessage.startThread({
+            name: `deal • ${p.cardName} — ${interaction.user.username}`,
+            autoArchiveDuration: 1440,
+          }) as ThreadChannel;
+          await thread.send('⚠️ Δεν ήταν δυνατή η δημιουργία private thread. Δημιουργήθηκε public ως fallback.');
+        }
+
+        // πρόσθεσε seller + buyer στο thread
+        try { await thread.members.add(p.requesterId); } catch {}
+        try { await thread.members.add(uid); } catch {}
+
+        // Controls + link στο original post για context
+        // πάρε το embed από το public μήνυμα (ή χτίστο fallback από το state)
+        const origEmbed = postMessage.embeds?.[0];
+        let threadEmbed;
+        if (origEmbed) {
+          threadEmbed = EmbedBuilder.from(origEmbed);
+        } else {
+          // Fallback – αν για κάποιο λόγο δεν είχε embed το public post
+          threadEmbed = buildPublicPostEmbed({
+            approval: {
+              pid: p.pid,
+              kind: p.kind,
+              title: p.cardName,
+              quantity: p.quantity ?? undefined,
+              price: p.price ?? undefined,
+              location: p.location ?? undefined,
+              extra: p.extra ?? undefined,
+              requesterId: p.requesterId,
+            },
+          });
+          if (p.photo1) threadEmbed.setImage(p.photo1.url);
+          if (p.photo2) threadEmbed.addFields({ name: 'Επιπλέον φωτό', value: p.photo2.url });
+        }
+
+        await thread.send({
+          content: `🔔 Thread controls — πατήστε **Ολοκληρώθηκε** όταν τελειώσετε (και οι δύο).
+🔗 Σύνδεσμος στο post: ${postMessage.url}`,
+          embeds: [threadEmbed],
+          components: [buildCommThreadRow(pid)],
+        });
+
+        // ενημέρωσε state / CASE
+        p.contacts.add(uid);
+        p.buyerId = uid;
+        p.commThreadIds = Array.from(new Set([...(p.commThreadIds ?? []), thread.id]));
+        pendingApprovals.set(pid, p);
+
+        const caseThread: any = interaction.guild!.channels.cache.get(p.caseThreadId);
+        caseThread?.send(`📬 New interest by ${interaction.user} — άνοιξε **${thread.type === ChannelType.PrivateThread ? 'private' : 'public'}** thread <#${thread.id}>.`);
+
+        // refresh CASE (μένει OPEN)
+        const embed = buildCaseSummaryEmbed({
+          approval: {
+            pid: p.pid,
+            kind: p.kind,
+            title: p.cardName,
+            quantity: p.quantity ?? undefined,
+            price: p.price ?? undefined,
+            location: p.location ?? undefined,
+            extra: p.extra ?? undefined,
+            requesterId: p.requesterId,
+            images: photosToImages(p.photo1 ?? null, p.photo2 ?? null),
+          } as any,
+          status: (p.status ?? 'open') as CaseStatus,
+          sellerId: p.requesterId,
+          buyerId: p.buyerId,
+          sellerConfirmed: !!p.sellerConfirmed,
+          buyerConfirmed: !!p.buyerConfirmed,
+          contacts: Array.from(p.contacts ?? []),
+        });
+        const ct: any = interaction.guild!.channels.cache.get(p.caseThreadId);
+        const msg = await ct?.messages.fetch(p.caseMessageId);
+        if (msg) await msg.edit({ embeds: [embed] });
+
+        return interaction.editReply('🧵 Δημιουργήθηκε **private** thread επικοινωνίας.');
+      } catch (e) {
+        console.error('contact error', e);
+        return interaction.editReply('❌ Κάτι πήγε στραβά.');
+      }
     }
 
-    // -------- Mod Resolve (modal) --------
-    if (action === 'modresolve') {
-      if (!modPerm)
-        return interaction.followUp({ content: '⛔ Μόνο mods.', flags: MessageFlags.Ephemeral })
+    // --- Complete (στο comm thread) ---
+    if (action === 'complete') {
+      try {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-      const modal = new ModalBuilder().setCustomId(`modresolve:${pid}`).setTitle('Mod Resolve')
-      const outcome = new TextInputBuilder().setCustomId('outcome').setLabel('Outcome (seller|buyer|both|none)').setStyle(TextInputStyle.Short).setRequired(true)
-      const reason  = new TextInputBuilder().setCustomId('reason').setLabel('Αιτιολογία').setStyle(TextInputStyle.Paragraph).setRequired(true)
-      modal.addComponents(
-        new ActionRowBuilder<TextInputBuilder>().addComponents(outcome),
-        new ActionRowBuilder<TextInputBuilder>().addComponents(reason),
-      )
-      return interaction.showModal(modal)
-    }
+        const p = pendingApprovals.get(pid);
+        if (!p) return interaction.editReply('❌ Η αγγελία δεν βρέθηκε.');
 
-    // -------- Close post ------
-    if (action === 'close') {
-      if (!payload)
-        return interaction.followUp({ content: '❌ Δεν βρέθηκε η αγγελία.', flags: MessageFlags.Ephemeral })
+        const member = interaction.member as GuildMember;
+        const uid = interaction.user.id;
+        const isSeller = uid === p.requesterId;
+        const isBuyer = uid === p.buyerId;
 
-      const owner = interaction.user.id === payload.requesterId
-      if (!owner && !modPerm) {
-        return interaction.followUp({ content: '⛔ Μόνο ο δημιουργός ή mod.', flags: MessageFlags.Ephemeral })
-      }
+        // 1η επιβεβαίωση
+        if (!p.firstConfirmBy) {
+          p.firstConfirmBy = uid;
+          p.firstConfirmAt = Date.now();
+          if (isSeller) p.sellerConfirmed = true;
+          if (isBuyer) p.buyerConfirmed = true;
+          pendingApprovals.set(pid, p);
 
-      if (!payload.postedChannelId || !payload.postedMessageId) {
-        return interaction.followUp({ content: '❌ Δεν βρέθηκαν ids δημοσίευσης για την αγγελία.', flags: MessageFlags.Ephemeral })
-      }
-      const channel: any = interaction.guild!.channels.cache.get(payload.postedChannelId!)
-      const message = await channel?.messages.fetch(payload.postedMessageId!).catch(() => null)
+          const caseThread: any = interaction.guild!.channels.cache.get(p.caseThreadId);
+          caseThread?.send(`🕒 1η επιβεβαίωση από ${interaction.user} — περιμένουμε τον άλλο χρήστη (72h).`);
 
-      if (message) {
-        const orig = message.embeds?.[0]
-        if (orig) {
-          const updated = EmbedBuilder.from(orig).setTitle(`[CLOSED] ${orig.title}`)
-          const disabledRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-            new ButtonBuilder().setCustomId(`contact:${pid}`).setLabel('Ενδιαφέρομαι 🙋').setStyle(ButtonStyle.Primary).setDisabled(true),
-            new ButtonBuilder().setCustomId(`close:${pid}`).setLabel('Κλείσιμο Αγγελίας 🔒').setStyle(ButtonStyle.Secondary).setDisabled(true),
-          )
+          // 🔊 Δημοσίευση στο private comm thread (τρέχον κανάλι)
+          const commThread = interaction.channel;
+          if (commThread && 'isThread' in commThread && commThread.isThread()) {
+          const thread = commThread as ThreadChannel;
+
+          // αν είναι private, βεβαιώσου ότι το bot είναι μέλος
           try {
-            await message.edit({ embeds: [updated], components: [disabledRow] })
-          } catch (e) {
-            console.error('close edit error', e)
+              const me = await interaction.guild!.members.fetchMe();
+              const members = await thread.members.fetch().catch(() => null);
+              if (members && !members.has(me.id)) {
+                await thread.members.add(me.id).catch(() => null);
+            }
+            } catch {}
+
+            await thread.send(`✅ 1η επιβεβαίωση καταγράφηκε από ${interaction.user}. Περιμένουμε την άλλη πλευρά (72h).`);
+          }
+
+          await refreshCaseSummary(p);
+
+          // καθάρισε το ephemeral ώστε να μη φαίνεται "only visible to you"
+          try { await interaction.deleteReply(); } catch {}
+
+          return;
+        }
+
+        // 2η επιβεβαίωση — πρέπει να είναι άλλος, εκτός αν είναι mod
+        if (p.firstConfirmBy === uid && !isMod(member)) {
+          return interaction.editReply('ℹ️ Έχεις ήδη επιβεβαιώσει. Περιμένουμε την άλλη πλευρά (ή mod).');
+        }
+
+        // Συμπλήρωση ποιος είναι buyer/seller για το embed του public
+        let sellerId: string;
+        let buyerId: string;
+
+        if (p.kind === 'sell') {
+          sellerId = p.requesterId;
+          const other = uid === p.requesterId ? p.firstConfirmBy! : uid;
+          buyerId = other;
+        } else {
+          buyerId = p.requesterId;
+          const other = uid === p.requesterId ? p.firstConfirmBy! : uid;
+          sellerId = other;
+        }
+        p.buyerId = buyerId;
+        p.sellerConfirmed = p.sellerConfirmed || sellerId === p.firstConfirmBy || sellerId === uid;
+        p.buyerConfirmed = p.buyerConfirmed || buyerId === p.firstConfirmBy || buyerId === uid;
+
+        p.status = 'completed';
+        pendingApprovals.set(pid, p);
+
+        // Edit public post → [SOLD]/[BOUGHT] + disable row
+        if (p.postedChannelId && p.postedMessageId) {
+          const channel: any = interaction.guild!.channels.cache.get(p.postedChannelId);
+          const message = await channel.messages.fetch(p.postedMessageId);
+          const updated = buildPublicPostEmbed({
+            approval: {
+              pid: p.pid,
+              kind: p.kind,
+              title: p.cardName,
+              quantity: p.quantity ?? undefined,
+              price: p.price ?? undefined,
+              location: p.location ?? undefined,
+              extra: p.extra ?? undefined,
+              requesterId: p.requesterId,
+            },
+            statusTag: p.kind === 'sell' ? 'sold' : 'bought',
+            dealBetween: { sellerId, buyerId },
+          });
+          // ✅ public button disabled μετά το complete
+          await message.edit({ embeds: [updated], components: [buildPublicPostRow(false, pid)] });
+        }
+
+        // Κλείδωμα/αρχειοθέτηση όλων των comm threads
+        const currentThreadId = (interaction.channel as ThreadChannel | null)?.id;
+        for (const tid of p.commThreadIds ?? []) {
+          try {
+            const th = interaction.guild!.channels.cache.get(tid) as ThreadChannel | undefined;
+            if (!th) continue;
+            if (tid !== currentThreadId) {
+              await th.send(`ℹ️ Η αγγελία ολοκληρώθηκε με <@${sellerId}> ↔ <@${buyerId}>. Το thread κλειδώνει.`);
+            }
+            await th.setLocked(true).catch(() => void 0);
+            await th.setArchived(true).catch(() => void 0);
+          } catch {}
+        }
+
+// CASE logs + refresh
+const caseThread: any = interaction.guild!.channels.cache.get(p.caseThreadId);
+caseThread?.send(`🏁 Completed — <@${sellerId}> ↔ <@${buyerId}>.`);
+
+// 🔊 επίσης δημοσίευση στο comm thread (όχι ephemeral)
+const ch = interaction.channel;
+if (ch && 'isThread' in ch && ch.isThread()) {
+  const thread = ch as ThreadChannel;
+
+  // αν είναι private, βεβαιώσου ότι το bot είναι μέλος
+  try {
+    const me = await interaction.guild!.members.fetchMe();
+    const members = await thread.members.fetch().catch(() => null);
+    if (members && !members.has(me.id)) {
+      await thread.members.add(me.id).catch(() => null);
+    }
+  } catch {}
+
+  await thread.send(`🏁 Το deal ολοκληρώθηκε. <@${sellerId}> ↔ <@${buyerId}>`);
+}
+
+await refreshCaseSummary(p);
+
+// καθάρισε το ephemeral “only visible to you”
+try { await interaction.deleteReply(); } catch {}
+
+return;
+      } catch (e) {
+        console.error('complete error', e);
+        return interaction.editReply('❌ Κάτι πήγε στραβά στο complete.');
+      }
+    }
+
+    // --- Close (από mod/owner) ---
+    if (action === 'close') {
+      try {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+        const p = pendingApprovals.get(pid);
+        if (!p) return interaction.editReply('❌ Η αγγελία δεν βρέθηκε/ή δεν έχει CASE.');
+
+        const member = interaction.member as GuildMember;
+        const isOwner = interaction.user.id === p.requesterId;
+        if (!isOwner && !isMod(member)) {
+          return interaction.editReply('⛔ Μόνο owner ή mod μπορεί να κλείσει την αγγελία.');
+        }
+
+        // edit public post → [CLOSED] + disable row
+        const channel: any = interaction.guild!.channels.cache.get(p.postedChannelId!);
+        if (channel && p.postedMessageId) {
+          const message = await channel.messages.fetch(p.postedMessageId);
+          const orig = message.embeds?.[0];
+          if (orig) {
+            const updated = EmbedBuilder.from(orig).setTitle(`[CLOSED] ${orig.title}`);
+            const disabledRow = buildPublicPostRow(false, pid); // ✅ disabled μετά το close
+            await message.edit({ embeds: [updated], components: [disabledRow] });
           }
         }
+
+        // κλείδωσε όλα τα comm threads
+        for (const tid of p.commThreadIds ?? []) {
+          try {
+            const th = interaction.guild!.channels.cache.get(tid) as ThreadChannel | undefined;
+            if (!th) continue;
+            await th.send(`🔒 Η αγγελία έκλεισε. Το thread κλειδώνει.`).catch(() => void 0);
+            await th.setLocked(true).catch(() => void 0);
+            await th.setArchived(true).catch(() => void 0);
+          } catch {}
+        }
+
+        // refresh CASE status
+        p.status = 'closed';
+        pendingApprovals.set(pid, p);
+        await refreshCaseSummary(p);
+
+        // log στο CASE
+        if (p.caseThreadId) {
+          const caseThread: any = interaction.guild!.channels.cache.get(p.caseThreadId);
+          caseThread?.send(`🔒 Κλείσιμο αγγελίας από ${isOwner ? 'owner' : 'mod'} ${interaction.user}.`);
+        }
+
+        return interaction.editReply('🔒 Η αγγελία έκλεισε.');
+      } catch (e) {
+        console.error('close error', e);
+        return interaction.editReply('❌ Κάτι πήγε στραβά στο close.');
       }
-
-      try {
-        const caseThread: any = interaction.guild!.channels.cache.get(payload.caseThreadId)
-        caseThread?.send(`🔒 Κλείσιμο αγγελίας από ${owner ? 'owner' : 'mod'} ${interaction.user}.`)
-      } catch {}
-
-      return interaction.followUp({ content: '✅ Η αγγελία έκλεισε.', flags: MessageFlags.Ephemeral })
-    }
-  }
-
-  // ----- Modal submit: Mod Resolve -----
-  if (interaction.isModalSubmit() && interaction.customId.startsWith('modresolve:')) {
-    const pid = interaction.customId.split(':')[1]
-    const member = await interaction.guild!.members.fetch(interaction.user.id)
-    const modPerm = isMemberMod(member)
-    if (!modPerm)
-      return interaction.reply({ content: '⛔ Μόνο mods.', flags: MessageFlags.Ephemeral })
-
-    const outcome = interaction.fields.getTextInputValue('outcome')?.trim().toLowerCase()
-    const reason  = interaction.fields.getTextInputValue('reason')?.trim()
-    if (!['seller', 'buyer', 'both', 'none'].includes(outcome)) {
-      return interaction.reply({ content: '❌ Outcome: seller|buyer|both|none', flags: MessageFlags.Ephemeral })
     }
 
-    const deal = getDeal(pid)
-    if (!deal) {
-      return interaction.reply({ content: '❌ Δεν βρέθηκε deal.', flags: MessageFlags.Ephemeral })
+    // --- Mod Resolve (placeholder – μόνο log) ---
+    if (action === 'resolve') {
+      if (!interaction.isButton()) return;
+      await interaction.reply({ content: '🛡️ Mod Resolve (placeholder)', flags: MessageFlags.Ephemeral });
+      return;
     }
-
-    if (outcome === 'seller' || outcome === 'both') addReputation(deal.sellerId, 'seller')
-    if (outcome === 'buyer'  || outcome === 'both') addReputation(deal.buyerId, 'buyer')
-
-    try {
-      const caseThread: any = interaction.guild!.channels.cache.get(deal.caseThreadId)
-      await caseThread?.send(`🛡️ Mod Resolve από ${interaction.user}: \`${outcome}\` — ${reason}`)
-      const commThread: any = deal.threadId ? interaction.guild!.channels.cache.get(deal.threadId) : null
-      if (commThread) {
-        try {
-          const controlsMsg = await commThread.messages.fetch(deal.controlsMessageId).catch(() => null)
-          if (controlsMsg) await disableControls(controlsMsg)
-          await commThread.setArchived(true).catch(() => {})
-        } catch {}
-      }
-    } catch {}
-
-    return interaction.reply({ content: '✅ Καταχωρήθηκε το Mod Resolve.', flags: MessageFlags.Ephemeral })
-  }
+  });
 }
 
 /* =========================================================
-   Register interactions (κουμπώνουμε τον handler)
+   Helpers to persist approved posts
 ========================================================= */
-export function registerMarketInteractions(client: Client) {
-  client.on('interactionCreate', async (i) => {
-    await handleMarketCommand(i)
-  })
+
+type Approved = {
+  pid: string;
+  guildId?: string;
+  channelId?: string;
+  messageId?: string;
+};
+
+function saveApprovedPost(entry: Approved) {
+  const data = readJson<Approved[]>(FILES.approvals, []);
+  const idx = data.findIndex((x) => x.pid === entry.pid);
+  if (idx >= 0) data[idx] = entry;
+  else data.push(entry);
+  writeJsonAtomic(FILES.approvals, data);
 }
