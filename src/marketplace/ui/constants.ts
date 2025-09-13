@@ -6,7 +6,7 @@ export const COLORS = {
   closed: 0x95A5A6,    // γκρι
   completed: 0x2ECC71, // πράσινο
   resolved: 0xE67E22,  // πορτοκαλί
-   default:   0x2f3136,
+  default: 0x2f3136,   // default embed bg
 } as const;
 
 export const EMOJI = {
@@ -23,4 +23,5 @@ export const LABELS = {
   sold: '[SOLD]',
   bought: '[BOUGHT]',
   closed: '[CLOSED]',
+  traded: '[TRADED]',   // <-- για trade
 } as const;

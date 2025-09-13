@@ -34,9 +34,19 @@ type PendingSlash = {
 type PendingApproval = {
   pid: string;
   kind: Kind;
-  cardName: string;
-  price: number | null;
-  quantity: number;
+
+  // sell/buy
+  cardName?: string;
+  price?: number | null;
+  quantity?: number;
+
+  // trade
+  offerTitle?: string;
+  offerQty?: number;
+  wantTitle?: string;
+  wantQty?: number;
+  cashDelta?: number;
+
   location: string;
   extra: string;
   photo1?: { url: string } | null;
@@ -48,8 +58,8 @@ type PendingApproval = {
   postedMessageId?: string;
   postedChannelId?: string;
 
-  requesterId: string; // seller (στο SELL) / buyer (στο BUY)
-  buyerId?: string;    // ο αγοραστής όταν ολοκληρωθεί (ή last interested)
+  requesterId: string; // seller/requester/trader A
+  buyerId?: string;    // άλλος trader (ή buyer)
 
   // για refresh του CASE panel
   contacts: Set<string>;
@@ -104,7 +114,9 @@ function isMod(member: GuildMember | null | undefined): boolean {
 }
 
 // ✅ helper: φτιάχνει images[] από photo1/photo2
-function photosToImages(...photos: Array<{ url: string } | null | undefined>): string[] {
+function photosToImages(
+  ...photos: Array<({ url: string } | null | undefined)>
+): string[] {
   return photos.map(p => p?.url).filter(Boolean) as string[];
 }
 
@@ -122,7 +134,7 @@ const pendingApprovals = new Map<string, PendingApproval>();
 export function getMarketCommands() {
   const post = new SlashCommandBuilder()
     .setName('market')
-    .setDescription('Δημιούργησε αγγελία αγοράς/πώλησης')
+    .setDescription('Δημιούργησε αγγελία αγοράς/πώλησης/ανταλλαγής')
     .addSubcommand((s) =>
       s
         .setName('post')
@@ -133,12 +145,13 @@ export function getMarketCommands() {
             .setDescription('Είδος αγγελίας')
             .setRequired(true)
             .addChoices(
-              { name: 'Sell', value: 'sell' },
-              { name: 'Buy', value: 'buy' },
+              { name: 'Sell',  value: 'sell'  },
+              { name: 'Buy',   value: 'buy'   },
+              { name: 'Trade', value: 'trade' },
             ),
         )
         .addAttachmentOption((o) =>
-          o.setName('photo1').setDescription('Φωτογραφία 1').setRequired(true), // ✅ required
+          o.setName('photo1').setDescription('Φωτογραφία 1').setRequired(true),
         )
         .addAttachmentOption((o) =>
           o.setName('photo2').setDescription('Φωτογραφία 2').setRequired(false),
@@ -167,39 +180,61 @@ export function registerMarketInteractions(client: Client) {
         pendingSlashToModal.set(interaction.user.id, { kind, photo1, photo2 });
 
         const modal = new ModalBuilder().setCustomId('marketPost').setTitle('Νέα αγγελία');
-        const card = new TextInputBuilder()
-          .setCustomId('cardName')
-          .setLabel('Όνομα Κάρτας')
-          .setStyle(TextInputStyle.Short)
-          .setRequired(true);
-        const location = new TextInputBuilder()
-          .setCustomId('location')
-          .setLabel('Περιοχή')
-          .setStyle(TextInputStyle.Short)
-          .setRequired(false);
-        const quantity = new TextInputBuilder()
-          .setCustomId('quantity')
-          .setLabel('Ποσότητα')
-          .setStyle(TextInputStyle.Short)
-          .setRequired(true);
-        const price = new TextInputBuilder()
-          .setCustomId('price')
-          .setLabel('Τιμή (ή Budget αν BUY)')
-          .setStyle(TextInputStyle.Short)
-          .setRequired(true); // ✅ required
-        const extra = new TextInputBuilder()
-          .setCustomId('extra')
-          .setLabel('Extra πληροφορίες (π.χ. Τρόπος Παράδοσης)')
-          .setStyle(TextInputStyle.Paragraph)
-          .setRequired(false);
 
-        modal.addComponents(
-          new ActionRowBuilder<TextInputBuilder>().addComponents(card),
-          new ActionRowBuilder<TextInputBuilder>().addComponents(location),
-          new ActionRowBuilder<TextInputBuilder>().addComponents(quantity),
-          new ActionRowBuilder<TextInputBuilder>().addComponents(price),
-          new ActionRowBuilder<TextInputBuilder>().addComponents(extra),
-        );
+        if (kind === 'trade') {
+          const offerTitle = new TextInputBuilder()
+            .setCustomId('offerTitle').setLabel('Τι προσφέρεις').setStyle(TextInputStyle.Short).setRequired(true);
+          const offerQty = new TextInputBuilder()
+            .setCustomId('offerQty').setLabel('Ποσότητα (προσφορά)').setStyle(TextInputStyle.Short).setRequired(true);
+          const wantTitle = new TextInputBuilder()
+            .setCustomId('wantTitle').setLabel('Τι ζητάς').setStyle(TextInputStyle.Short).setRequired(true);
+          const wantQty = new TextInputBuilder()
+            .setCustomId('wantQty').setLabel('Ποσότητα (ζητούμενο)').setStyle(TextInputStyle.Short).setRequired(true);
+          const cashDelta = new TextInputBuilder()
+            .setCustomId('cashDelta').setLabel('Διαφορά σε € (+ζητάς, -δίνεις)').setStyle(TextInputStyle.Short).setRequired(false);
+
+          modal.addComponents(
+            new ActionRowBuilder<TextInputBuilder>().addComponents(offerTitle),
+            new ActionRowBuilder<TextInputBuilder>().addComponents(offerQty),
+            new ActionRowBuilder<TextInputBuilder>().addComponents(wantTitle),
+            new ActionRowBuilder<TextInputBuilder>().addComponents(wantQty),
+            new ActionRowBuilder<TextInputBuilder>().addComponents(cashDelta),
+          );
+        } else {
+          const card = new TextInputBuilder()
+            .setCustomId('cardName')
+            .setLabel('Όνομα Κάρτας')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true);
+          const location = new TextInputBuilder()
+            .setCustomId('location')
+            .setLabel('Περιοχή')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(false);
+          const quantity = new TextInputBuilder()
+            .setCustomId('quantity')
+            .setLabel('Ποσότητα')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true);
+          const price = new TextInputBuilder()
+            .setCustomId('price')
+            .setLabel('Τιμή (ή Budget αν BUY)')
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true);
+          const extra = new TextInputBuilder()
+            .setCustomId('extra')
+            .setLabel('Extra πληροφορίες (π.χ. Τρόπος Παράδοσης)')
+            .setStyle(TextInputStyle.Paragraph)
+            .setRequired(false);
+
+          modal.addComponents(
+            new ActionRowBuilder<TextInputBuilder>().addComponents(card),
+            new ActionRowBuilder<TextInputBuilder>().addComponents(location),
+            new ActionRowBuilder<TextInputBuilder>().addComponents(quantity),
+            new ActionRowBuilder<TextInputBuilder>().addComponents(price),
+            new ActionRowBuilder<TextInputBuilder>().addComponents(extra),
+          );
+        }
 
         await interaction.showModal(modal);
       }
@@ -218,23 +253,54 @@ export function registerMarketInteractions(client: Client) {
 
         const { kind, photo1, photo2 } = saved as { kind: Kind; photo1: any; photo2: any };
 
-        const cardName = interaction.fields.getTextInputValue('cardName').trim();
-        const location = interaction.fields.getTextInputValue('location').trim();
-        const quantity = Number(interaction.fields.getTextInputValue('quantity'));
-        const priceParsed = interaction.fields.getTextInputValue('price').trim();
-        const price = priceParsed ? Number(priceParsed.replace(',', '.')) : null;
-        const extra = interaction.fields.getTextInputValue('extra').trim();
+        // κοινά
         const requesterId = interaction.user.id;
+
+        // sell/buy
+        let cardName: string | undefined;
+        let quantity: number | undefined;
+        let price: number | null | undefined;
+
+        // trade
+        let offerTitle: string | undefined;
+        let offerQty: number | undefined;
+        let wantTitle: string | undefined;
+        let wantQty: number | undefined;
+        let cashDelta: number | undefined;
+
+        // shared extra info
+        let location = '';
+        let extra = '';
+
+        if (kind === 'trade') {
+          offerTitle = interaction.fields.getTextInputValue('offerTitle').trim();
+          offerQty   = Number(interaction.fields.getTextInputValue('offerQty'));
+          wantTitle  = interaction.fields.getTextInputValue('wantTitle').trim();
+          wantQty    = Number(interaction.fields.getTextInputValue('wantQty'));
+          const cd   = interaction.fields.getTextInputValue('cashDelta')?.trim();
+          cashDelta  = cd ? Number(cd.replace(',', '.')) : undefined;
+        } else {
+          cardName   = interaction.fields.getTextInputValue('cardName').trim();
+          location   = interaction.fields.getTextInputValue('location').trim();
+          quantity   = Number(interaction.fields.getTextInputValue('quantity'));
+          const priceParsed = interaction.fields.getTextInputValue('price').trim();
+          price      = priceParsed ? Number(priceParsed.replace(',', '.')) : null;
+          extra      = interaction.fields.getTextInputValue('extra').trim();
+        }
 
         const LOG_ID = env('MARKET_LOG_CHANNEL_ID');
         const logChannel: any = interaction.guild?.channels.cache.get(LOG_ID);
         if (!logChannel) return interaction.editReply('⚠️ Δεν βρέθηκε MARKET_LOG_CHANNEL_ID στο .env.');
 
+        const displayTitle = kind === 'trade'
+          ? `${offerTitle} ↔ ${wantTitle}`
+          : cardName!;
+
         const stub = await logChannel.send(
-          `🧾 Case for **${cardName}** από <@${interaction.user.id}> (${kind.toUpperCase()})`,
+          `🧾 Case for **${displayTitle}** από <@${interaction.user.id}> (${kind.toUpperCase()})`,
         );
         const caseThread = await stub.startThread({
-          name: `CASE • ${cardName} — ${interaction.user.username}`,
+          name: `CASE • ${displayTitle} — ${interaction.user.username}`,
           autoArchiveDuration: 10080,
           type: ChannelType.PrivateThread,
         });
@@ -249,13 +315,16 @@ export function registerMarketInteractions(client: Client) {
               approval: {
                 pid,
                 kind,
-                title: cardName,
+                title: displayTitle,
+                // sell/buy
                 quantity: quantity ?? undefined,
                 price: price ?? undefined,
-                location: location ?? undefined,
-                extra: extra ?? undefined,
+                // trade
+                offerTitle, offerQty, wantTitle, wantQty, cashDelta,
+                // κοινά
+                location: kind === 'trade' ? undefined : location,
+                extra: kind === 'trade' ? undefined : extra,
                 requesterId,
-                // ✅ δώσε εικόνες στο embed (1η θα φανεί, 2η ως link)
                 images: photosToImages(
                   photo1 ? { url: photo1.url } : null,
                   photo2 ? { url: photo2.url } : null
@@ -274,11 +343,15 @@ export function registerMarketInteractions(client: Client) {
         pendingApprovals.set(pid, {
           pid,
           kind,
+          // sell/buy
           cardName,
-          price,
-          quantity,
-          location,
-          extra,
+          price: price ?? null,
+          quantity: quantity ?? 1,
+          // trade
+          offerTitle, offerQty, wantTitle, wantQty, cashDelta,
+          // κοινά
+          location: location ?? '',
+          extra: extra ?? '',
           photo1: photo1 ? { url: photo1.url } : null,
           photo2: photo2 ? { url: photo2.url } : null,
           caseThreadId: caseThread.id,
@@ -289,7 +362,7 @@ export function registerMarketInteractions(client: Client) {
           commThreadIds: [],
         });
 
-        return interaction.editReply(`📌 Δημιουργήθηκε CASE για **${cardName}** (pid=${pid}).`);
+        return interaction.editReply(`📌 Δημιουργήθηκε CASE για **${displayTitle}** (pid=${pid}).`);
       } catch (e) {
         console.error('modal submit error', e);
         return interaction.editReply('❌ Κάτι πήγε στραβά.');
@@ -307,17 +380,29 @@ export function registerMarketInteractions(client: Client) {
         const caseMessage = await caseThread?.messages.fetch(p.caseMessageId);
         if (!caseMessage) return;
 
+        const displayTitle =
+          p.kind === 'trade'
+            ? `${p.offerTitle ?? '—'} ↔ ${p.wantTitle ?? '—'}`
+            : p.cardName ?? '—';
+
         const embed = buildCaseSummaryEmbed({
           approval: {
             pid: p.pid,
             kind: p.kind,
-            title: p.cardName,
+            title: displayTitle,
+            // sell/buy
             quantity: p.quantity ?? undefined,
             price: p.price ?? undefined,
+            // trade
+            offerTitle: p.offerTitle,
+            offerQty: p.offerQty,
+            wantTitle: p.wantTitle,
+            wantQty: p.wantQty,
+            cashDelta: p.cashDelta,
+            // κοινά
             location: p.location ?? undefined,
             extra: p.extra ?? undefined,
             requesterId: p.requesterId,
-            // ✅ κράτα εικόνες και στο refresh
             images: photosToImages(p.photo1 ?? null, p.photo2 ?? null),
           } as any,
           status: (p.status ?? 'pending') as CaseStatus,
@@ -333,10 +418,7 @@ export function registerMarketInteractions(client: Client) {
             ? [buildCaseReviewRow(p.pid, { disableApproveReject: true, modResolveEnabled: true })]
             : [buildCaseReviewRow(p.pid, { disableApproveReject: false, modResolveEnabled: true })];
 
-        await caseMessage.edit({
-          embeds: [embed],
-          components: changedComponents,
-        });
+        await caseMessage.edit({ embeds: [embed], components: changedComponents });
       } catch (e) {
         console.error('refreshCaseSummary error', e);
       }
@@ -355,26 +437,44 @@ export function registerMarketInteractions(client: Client) {
           return interaction.editReply('⛔ Μόνο mods μπορούν να κάνουν approve.');
 
         const isSell = payload.kind === 'sell';
-        const { kind, price, quantity, cardName, location, extra, requesterId, photo1, photo2 } = payload;
+        const isBuy  = payload.kind === 'buy';
+        const { kind } = payload;
+
+        const displayTitle =
+          kind === 'trade'
+            ? `${payload.offerTitle ?? '—'} ↔ ${payload.wantTitle ?? '—'}`
+            : payload.cardName ?? '—';
 
         const publicEmbed = buildPublicPostEmbed({
           approval: {
             pid,
             kind,
-            title: cardName,
-            quantity: quantity ?? undefined,
-            price: price ?? undefined,
-            location: location ?? undefined,
-            extra: extra ?? undefined,
-            requesterId,
+            title: displayTitle,
+            // sell/buy
+            quantity: payload.quantity ?? undefined,
+            price: payload.price ?? undefined,
+            // trade
+            offerTitle: payload.offerTitle,
+            offerQty: payload.offerQty,
+            wantTitle: payload.wantTitle,
+            wantQty: payload.wantQty,
+            cashDelta: payload.cashDelta,
+            // κοινά
+            location: payload.location ?? undefined,
+            extra: payload.extra ?? undefined,
+            requesterId: payload.requesterId,
           },
         });
 
         // Public εικόνες: 1η στο embed, 2η ως link
-        if (photo1) publicEmbed.setImage(photo1.url);
-        if (photo2) publicEmbed.addFields({ name: 'Επιπλέον φωτό', value: photo2.url });
+        if (payload.photo1) publicEmbed.setImage(payload.photo1.url);
+        if (payload.photo2) publicEmbed.addFields({ name: 'Επιπλέον φωτό', value: payload.photo2.url });
 
-        const targetId = isSell ? env('SELL_CHANNEL_ID') : env('BUY_CHANNEL_ID');
+        const targetId =
+          isSell ? env('SELL_CHANNEL_ID') :
+          isBuy  ? env('BUY_CHANNEL_ID')  :
+                   env('TRADE_CHANNEL_ID');
+
         const targetChannel: any = interaction.guild!.channels.cache.get(targetId!);
         if (!targetId || !targetChannel) {
           console.error('Approve error: target channel missing', { kind, targetId });
@@ -456,7 +556,7 @@ export function registerMarketInteractions(client: Client) {
         let thread: ThreadChannel;
         try {
           thread = await channel.threads.create({
-            name: `deal • ${p.cardName} — ${interaction.user.username}`,
+            name: `deal • ${p.kind === 'trade' ? (p.offerTitle ?? '—') : (p.cardName ?? '—')} — ${interaction.user.username}`,
             autoArchiveDuration: 1440,
             type: ChannelType.PrivateThread,
             reason: `Private deal thread for PID ${p.pid}`,
@@ -464,7 +564,7 @@ export function registerMarketInteractions(client: Client) {
         } catch {
           // Fallback: public thread πάνω στο μήνυμα
           thread = await postMessage.startThread({
-            name: `deal • ${p.cardName} — ${interaction.user.username}`,
+            name: `deal • ${p.kind === 'trade' ? (p.offerTitle ?? '—') : (p.cardName ?? '—')} — ${interaction.user.username}`,
             autoArchiveDuration: 1440,
           }) as ThreadChannel;
           await thread.send('⚠️ Δεν ήταν δυνατή η δημιουργία private thread. Δημιουργήθηκε public ως fallback.');
@@ -475,7 +575,6 @@ export function registerMarketInteractions(client: Client) {
         try { await thread.members.add(uid); } catch {}
 
         // Controls + link στο original post για context
-        // πάρε το embed από το public μήνυμα (ή χτίστο fallback από το state)
         const origEmbed = postMessage.embeds?.[0];
         let threadEmbed;
         if (origEmbed) {
@@ -486,9 +585,16 @@ export function registerMarketInteractions(client: Client) {
             approval: {
               pid: p.pid,
               kind: p.kind,
-              title: p.cardName,
+              title: p.kind === 'trade'
+                ? `${p.offerTitle ?? '—'} ↔ ${p.wantTitle ?? '—'}`
+                : (p.cardName ?? '—'),
               quantity: p.quantity ?? undefined,
               price: p.price ?? undefined,
+              offerTitle: p.offerTitle,
+              offerQty: p.offerQty,
+              wantTitle: p.wantTitle,
+              wantQty: p.wantQty,
+              cashDelta: p.cashDelta,
               location: p.location ?? undefined,
               extra: p.extra ?? undefined,
               requesterId: p.requesterId,
@@ -515,28 +621,7 @@ export function registerMarketInteractions(client: Client) {
         caseThread?.send(`📬 New interest by ${interaction.user} — άνοιξε **${thread.type === ChannelType.PrivateThread ? 'private' : 'public'}** thread <#${thread.id}>.`);
 
         // refresh CASE (μένει OPEN)
-        const embed = buildCaseSummaryEmbed({
-          approval: {
-            pid: p.pid,
-            kind: p.kind,
-            title: p.cardName,
-            quantity: p.quantity ?? undefined,
-            price: p.price ?? undefined,
-            location: p.location ?? undefined,
-            extra: p.extra ?? undefined,
-            requesterId: p.requesterId,
-            images: photosToImages(p.photo1 ?? null, p.photo2 ?? null),
-          } as any,
-          status: (p.status ?? 'open') as CaseStatus,
-          sellerId: p.requesterId,
-          buyerId: p.buyerId,
-          sellerConfirmed: !!p.sellerConfirmed,
-          buyerConfirmed: !!p.buyerConfirmed,
-          contacts: Array.from(p.contacts ?? []),
-        });
-        const ct: any = interaction.guild!.channels.cache.get(p.caseThreadId);
-        const msg = await ct?.messages.fetch(p.caseMessageId);
-        if (msg) await msg.edit({ embeds: [embed] });
+        await refreshCaseSummary(p);
 
         return interaction.editReply('🧵 Δημιουργήθηκε **private** thread επικοινωνίας.');
       } catch (e) {
@@ -572,25 +657,22 @@ export function registerMarketInteractions(client: Client) {
           // 🔊 Δημοσίευση στο private comm thread (τρέχον κανάλι)
           const commThread = interaction.channel;
           if (commThread && 'isThread' in commThread && commThread.isThread()) {
-          const thread = commThread as ThreadChannel;
+            const thread = commThread as ThreadChannel;
 
-          // αν είναι private, βεβαιώσου ότι το bot είναι μέλος
-          try {
+            // αν είναι private, βεβαιώσου ότι το bot είναι μέλος
+            try {
               const me = await interaction.guild!.members.fetchMe();
               const members = await thread.members.fetch().catch(() => null);
               if (members && !members.has(me.id)) {
                 await thread.members.add(me.id).catch(() => null);
-            }
+              }
             } catch {}
 
             await thread.send(`✅ 1η επιβεβαίωση καταγράφηκε από ${interaction.user}. Περιμένουμε την άλλη πλευρά (72h).`);
           }
 
           await refreshCaseSummary(p);
-
-          // καθάρισε το ephemeral ώστε να μη φαίνεται "only visible to you"
           try { await interaction.deleteReply(); } catch {}
-
           return;
         }
 
@@ -607,10 +689,15 @@ export function registerMarketInteractions(client: Client) {
           sellerId = p.requesterId;
           const other = uid === p.requesterId ? p.firstConfirmBy! : uid;
           buyerId = other;
-        } else {
+        } else if (p.kind === 'buy') {
           buyerId = p.requesterId;
           const other = uid === p.requesterId ? p.firstConfirmBy! : uid;
           sellerId = other;
+        } else {
+          // trade: δύο traders, απλώς ορίζουμε A/B για εμφάνιση
+          sellerId = p.requesterId;
+          const other = uid === p.requesterId ? p.firstConfirmBy! : uid;
+          buyerId = other;
         }
         p.buyerId = buyerId;
         p.sellerConfirmed = p.sellerConfirmed || sellerId === p.firstConfirmBy || sellerId === uid;
@@ -619,7 +706,7 @@ export function registerMarketInteractions(client: Client) {
         p.status = 'completed';
         pendingApprovals.set(pid, p);
 
-        // Edit public post → [SOLD]/[BOUGHT] + disable row
+        // Edit public post → [SOLD]/[BOUGHT]/[TRADED] + disable row
         if (p.postedChannelId && p.postedMessageId) {
           const channel: any = interaction.guild!.channels.cache.get(p.postedChannelId);
           const message = await channel.messages.fetch(p.postedMessageId);
@@ -627,17 +714,23 @@ export function registerMarketInteractions(client: Client) {
             approval: {
               pid: p.pid,
               kind: p.kind,
-              title: p.cardName,
+              title: p.kind === 'trade'
+                ? `${p.offerTitle ?? '—'} ↔ ${p.wantTitle ?? '—'}`
+                : (p.cardName ?? '—'),
               quantity: p.quantity ?? undefined,
               price: p.price ?? undefined,
+              offerTitle: p.offerTitle,
+              offerQty: p.offerQty,
+              wantTitle: p.wantTitle,
+              wantQty: p.wantQty,
+              cashDelta: p.cashDelta,
               location: p.location ?? undefined,
               extra: p.extra ?? undefined,
               requesterId: p.requesterId,
             },
-            statusTag: p.kind === 'sell' ? 'sold' : 'bought',
+            statusTag: p.kind === 'sell' ? 'sold' : p.kind === 'buy' ? 'bought' : 'traded',
             dealBetween: { sellerId, buyerId },
           });
-          // ✅ public button disabled μετά το complete
           await message.edit({ embeds: [updated], components: [buildPublicPostRow(false, pid)] });
         }
 
@@ -655,33 +748,25 @@ export function registerMarketInteractions(client: Client) {
           } catch {}
         }
 
-// CASE logs + refresh
-const caseThread: any = interaction.guild!.channels.cache.get(p.caseThreadId);
-caseThread?.send(`🏁 Completed — <@${sellerId}> ↔ <@${buyerId}>.`);
+        const caseThread: any = interaction.guild!.channels.cache.get(p.caseThreadId);
+        caseThread?.send(`🏁 Completed — <@${sellerId}> ↔ <@${buyerId}>.`);
 
-// 🔊 επίσης δημοσίευση στο comm thread (όχι ephemeral)
-const ch = interaction.channel;
-if (ch && 'isThread' in ch && ch.isThread()) {
-  const thread = ch as ThreadChannel;
+        const ch = interaction.channel;
+        if (ch && 'isThread' in ch && ch.isThread()) {
+          const thread = ch as ThreadChannel;
+          try {
+            const me = await interaction.guild!.members.fetchMe();
+            const members = await thread.members.fetch().catch(() => null);
+            if (members && !members.has(me.id)) {
+              await thread.members.add(me.id).catch(() => null);
+            }
+          } catch {}
+          await thread.send(`🏁 Το deal ολοκληρώθηκε. <@${sellerId}> ↔ <@${buyerId}>`);
+        }
 
-  // αν είναι private, βεβαιώσου ότι το bot είναι μέλος
-  try {
-    const me = await interaction.guild!.members.fetchMe();
-    const members = await thread.members.fetch().catch(() => null);
-    if (members && !members.has(me.id)) {
-      await thread.members.add(me.id).catch(() => null);
-    }
-  } catch {}
-
-  await thread.send(`🏁 Το deal ολοκληρώθηκε. <@${sellerId}> ↔ <@${buyerId}>`);
-}
-
-await refreshCaseSummary(p);
-
-// καθάρισε το ephemeral “only visible to you”
-try { await interaction.deleteReply(); } catch {}
-
-return;
+        await refreshCaseSummary(p);
+        try { await interaction.deleteReply(); } catch {}
+        return;
       } catch (e) {
         console.error('complete error', e);
         return interaction.editReply('❌ Κάτι πήγε στραβά στο complete.');
@@ -709,7 +794,7 @@ return;
           const orig = message.embeds?.[0];
           if (orig) {
             const updated = EmbedBuilder.from(orig).setTitle(`[CLOSED] ${orig.title}`);
-            const disabledRow = buildPublicPostRow(false, pid); // ✅ disabled μετά το close
+            const disabledRow = buildPublicPostRow(false, pid);
             await message.edit({ embeds: [updated], components: [disabledRow] });
           }
         }
