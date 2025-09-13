@@ -9,5 +9,5 @@ export function caseColor(status: CaseStatus): number {
     completed: COLORS.completed ?? COLORS.closed,
     resolved:  COLORS.resolved  ?? COLORS.closed,
   };
-  return map[status] ?? COLORS.closed; // fallback χωρίς COLORS.default
+  return map[status] ?? COLORS.default;
 }
