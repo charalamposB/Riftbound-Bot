@@ -12,6 +12,7 @@
   Interaction,
   GuildMember,
   ThreadChannel,
+  PermissionsBitField,
 } from 'discord.js';
 
 import { buildCaseReviewRow, buildPublicPostRow, buildCommThreadRow } from './ui/components';
@@ -118,6 +119,66 @@ function photosToImages(
   ...photos: Array<({ url: string } | null | undefined)>
 ): string[] {
   return photos.map(p => p?.url).filter(Boolean) as string[];
+}
+
+/* ---------- THREAD HELPERS (νέο) ---------- */
+
+async function fetchThreadSafe(guild: any, id: string): Promise<ThreadChannel | null> {
+  try {
+    const ch = await guild.channels.fetch(id).catch(() => null);
+    if (!ch) return null;
+    if ('isThread' in ch && (ch as ThreadChannel).isThread()) return ch as ThreadChannel;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function ensureBotInPrivate(thread: ThreadChannel) {
+  try {
+    const me = await thread.guild.members.fetchMe();
+    const members = await thread.members.fetch().catch(() => null);
+    if (members && !members.has(me.id)) {
+      await thread.members.add(me.id).catch(() => null);
+    }
+  } catch {}
+}
+
+async function lockAndArchiveThread(
+  thread: ThreadChannel,
+  notifyMsg?: string
+): Promise<void> {
+  try {
+    await ensureBotInPrivate(thread);
+
+    if (notifyMsg) {
+      await thread.send(notifyMsg).catch(() => void 0);
+    }
+
+    // Permissions sanity check: ManageThreads
+    const canManage = thread
+      .permissionsFor(thread.client.user!.id)
+      ?.has(PermissionsBitField.Flags.ManageThreads);
+    if (!canManage) {
+      console.error('[market] Missing ManageThreads for', thread.id, 'parent:', thread.parent?.name);
+    }
+
+    // One-shot edit για να αποφύγουμε race μεταξύ setLocked/setArchived
+    await thread.edit({ locked: true, archived: true }).catch((e) => {
+      console.error('[market] edit(locked+archived) failed for', thread.id, e);
+      throw e;
+    });
+
+    // Προαιρετική επιβεβαίωση
+    try {
+      const refetched = await fetchThreadSafe(thread.guild, thread.id);
+      if (refetched) {
+        console.log('[market] archived:', refetched.archived, 'locked:', refetched.locked, 'id:', refetched.id);
+      }
+    } catch {}
+  } catch (e) {
+    console.error('[market] lockAndArchiveThread error for', thread.id, e);
+  }
 }
 
 /* =========================================================
@@ -658,16 +719,7 @@ export function registerMarketInteractions(client: Client) {
           const commThread = interaction.channel;
           if (commThread && 'isThread' in commThread && commThread.isThread()) {
             const thread = commThread as ThreadChannel;
-
-            // αν είναι private, βεβαιώσου ότι το bot είναι μέλος
-            try {
-              const me = await interaction.guild!.members.fetchMe();
-              const members = await thread.members.fetch().catch(() => null);
-              if (members && !members.has(me.id)) {
-                await thread.members.add(me.id).catch(() => null);
-              }
-            } catch {}
-
+            await ensureBotInPrivate(thread);
             await thread.send(`✅ 1η επιβεβαίωση καταγράφηκε από ${interaction.user}. Περιμένουμε την άλλη πλευρά (72h).`);
           }
 
@@ -734,35 +786,26 @@ export function registerMarketInteractions(client: Client) {
           await message.edit({ embeds: [updated], components: [buildPublicPostRow(false, pid)] });
         }
 
-        // Κλείδωμα/αρχειοθέτηση όλων των comm threads
+        // Κλείδωμα/αρχειοθέτηση όλων των comm threads (fetch + one-shot edit)
         const currentThreadId = (interaction.channel as ThreadChannel | null)?.id;
         for (const tid of p.commThreadIds ?? []) {
           try {
-            const th = interaction.guild!.channels.cache.get(tid) as ThreadChannel | undefined;
-            if (!th) continue;
-            if (tid !== currentThreadId) {
-              await th.send(`ℹ️ Η αγγελία ολοκληρώθηκε με <@${sellerId}> ↔ <@${buyerId}>. Το thread κλειδώνει.`);
+            const th = await fetchThreadSafe(interaction.guild!, tid);
+            if (!th) {
+              console.warn('[market] comm thread not found on complete:', tid);
+              continue;
             }
-            await th.setLocked(true).catch(() => void 0);
-            await th.setArchived(true).catch(() => void 0);
-          } catch {}
+            const note = tid !== currentThreadId
+              ? `ℹ️ Η αγγελία ολοκληρώθηκε με <@${sellerId}> ↔ <@${buyerId}>. Το thread κλειδώνει & αρχειοθετείται.`
+              : '🏁 Το deal ολοκληρώθηκε. Το thread κλειδώνει & αρχειοθετείται.';
+            await lockAndArchiveThread(th, note);
+          } catch (e) {
+            console.error('[market] complete: lock/archive failed for', tid, e);
+          }
         }
 
         const caseThread: any = interaction.guild!.channels.cache.get(p.caseThreadId);
         caseThread?.send(`🏁 Completed — <@${sellerId}> ↔ <@${buyerId}>.`);
-
-        const ch = interaction.channel;
-        if (ch && 'isThread' in ch && ch.isThread()) {
-          const thread = ch as ThreadChannel;
-          try {
-            const me = await interaction.guild!.members.fetchMe();
-            const members = await thread.members.fetch().catch(() => null);
-            if (members && !members.has(me.id)) {
-              await thread.members.add(me.id).catch(() => null);
-            }
-          } catch {}
-          await thread.send(`🏁 Το deal ολοκληρώθηκε. <@${sellerId}> ↔ <@${buyerId}>`);
-        }
 
         await refreshCaseSummary(p);
         try { await interaction.deleteReply(); } catch {}
@@ -799,15 +842,18 @@ export function registerMarketInteractions(client: Client) {
           }
         }
 
-        // κλείδωσε όλα τα comm threads
+        // κλείδωσε/αρχειοθέτησε όλα τα comm threads (fetch + one-shot edit)
         for (const tid of p.commThreadIds ?? []) {
           try {
-            const th = interaction.guild!.channels.cache.get(tid) as ThreadChannel | undefined;
-            if (!th) continue;
-            await th.send(`🔒 Η αγγελία έκλεισε. Το thread κλειδώνει.`).catch(() => void 0);
-            await th.setLocked(true).catch(() => void 0);
-            await th.setArchived(true).catch(() => void 0);
-          } catch {}
+            const th = await fetchThreadSafe(interaction.guild!, tid);
+            if (!th) {
+              console.warn('[market] comm thread not found on close:', tid);
+              continue;
+            }
+            await lockAndArchiveThread(th, '🔒 Η αγγελία έκλεισε. Το thread κλειδώνει & αρχειοθετείται.');
+          } catch (e) {
+            console.error('[market] close: lock/archive failed for', tid, e);
+          }
         }
 
         // refresh CASE status
