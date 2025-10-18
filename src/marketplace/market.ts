@@ -1,4 +1,5 @@
-﻿import {
+﻿// src/marketplace/market.ts
+import {
   SlashCommandBuilder,
   ModalBuilder,
   TextInputBuilder,
@@ -13,6 +14,10 @@
   GuildMember,
   ThreadChannel,
   PermissionsBitField,
+  ButtonBuilder,
+  ButtonStyle,
+  Message,
+  Collection,
 } from 'discord.js';
 
 import { buildCaseReviewRow, buildPublicPostRow, buildCommThreadRow } from './ui/components';
@@ -20,7 +25,11 @@ import { buildPublicPostEmbed, buildCaseSummaryEmbed } from './ui/embeds';
 import type { CaseStatus, Kind } from './types';
 
 import fs from 'fs';
+import * as pendingStore from '../lib/pendingStore';
 import path from 'path';
+import { photosToImages as _photosToImages, extFromUrl as _extFromUrl, uniquePush as _uniquePush, buildFilesFromPhotos } from './lib/images';
+import { runWithLock as _runWithLock } from './lib/locks';
+import { toStoreApproval as _toStoreApproval, persistApproval as _persistApproval, getApprovalFromStore as _getApprovalFromStore, deleteApproval as _deleteApproval } from './lib/persistence';
 
 /* =========================================================
    Types (τοπικά για το αρχείο)
@@ -30,6 +39,26 @@ type PendingSlash = {
   kind: Kind;
   photo1: any;
   photo2: any;
+};
+
+// ✨ Νέο: Pending για panel flow (modal → photo upload)
+type PendingPanelPost = {
+  userId: string;
+  kind: Kind;
+  // sell/buy
+  cardName?: string;
+  price?: number | null;
+  quantity?: number;
+  // trade
+  offerTitle?: string;
+  offerQty?: number;
+  wantTitle?: string;
+  wantQty?: number;
+  cashDelta?: number;
+  // shared
+  location: string;
+  extra: string;
+  createdAt: number;
 };
 
 type PendingApproval = {
@@ -59,18 +88,16 @@ type PendingApproval = {
   postedMessageId?: string;
   postedChannelId?: string;
 
-  requesterId: string; // seller/requester/trader A
-  buyerId?: string;    // άλλος trader (ή buyer)
+  requesterId: string;
+  buyerId?: string;
 
-  // για refresh του CASE panel
-  contacts: Set<string>;
+  contacts: string[];
   status?: CaseStatus;
   firstConfirmBy?: string;
   firstConfirmAt?: number;
   sellerConfirmed?: boolean;
   buyerConfirmed?: boolean;
 
-  // comm threads για να τα κλειδώνουμε όλα
   commThreadIds?: string[];
 };
 
@@ -114,14 +141,23 @@ function isMod(member: GuildMember | null | undefined): boolean {
   return !!member?.permissions?.has(PermissionFlagsBits.ManageGuild);
 }
 
-// ✅ helper: φτιάχνει images[] από photo1/photo2
-function photosToImages(
-  ...photos: Array<({ url: string } | null | undefined)>
-): string[] {
-  return photos.map(p => p?.url).filter(Boolean) as string[];
+const photosToImages = _photosToImages;
+const extFromUrl = _extFromUrl;
+const uniquePush = _uniquePush;
+const runWithLock = _runWithLock;
+const toStoreApproval = _toStoreApproval;
+const persistApproval = _persistApproval;
+const getApprovalFromStore = _getApprovalFromStore;
+const deleteApproval = _deleteApproval;
+
+// Helper for dynamic imports: use .ts in development (ts-node-dev) and .js in production builds
+function handlerImportPath(base: string) {
+  const dev = process.env.NODE_ENV !== 'production';
+  const ext = dev ? '.ts' : '.js';
+  return `./handlers/${base}${ext}`;
 }
 
-/* ---------- THREAD HELPERS (νέο) ---------- */
+/* ---------- THREAD HELPERS ---------- */
 
 async function fetchThreadSafe(guild: any, id: string): Promise<ThreadChannel | null> {
   try {
@@ -155,7 +191,6 @@ async function lockAndArchiveThread(
       await thread.send(notifyMsg).catch(() => void 0);
     }
 
-    // Permissions sanity check: ManageThreads
     const canManage = thread
       .permissionsFor(thread.client.user!.id)
       ?.has(PermissionsBitField.Flags.ManageThreads);
@@ -163,13 +198,11 @@ async function lockAndArchiveThread(
       console.error('[market] Missing ManageThreads for', thread.id, 'parent:', thread.parent?.name);
     }
 
-    // One-shot edit για να αποφύγουμε race μεταξύ setLocked/setArchived
     await thread.edit({ locked: true, archived: true }).catch((e) => {
       console.error('[market] edit(locked+archived) failed for', thread.id, e);
       throw e;
     });
 
-    // Προαιρετική επιβεβαίωση
     try {
       const refetched = await fetchThreadSafe(thread.guild, thread.id);
       if (refetched) {
@@ -182,11 +215,25 @@ async function lockAndArchiveThread(
 }
 
 /* =========================================================
-   In-memory pending (slash→modal / approvals)
+   In-memory pending
 ========================================================= */
 
 const pendingSlashToModal = new Map<string, PendingSlash>();
 const pendingApprovals = new Map<string, PendingApproval>();
+
+function loadApproval(pid: string): PendingApproval | undefined {
+  const inMem = pendingApprovals.get(pid);
+  if (inMem) return inMem;
+  const fromStore = getApprovalFromStore(pid);
+  if (fromStore) {
+    pendingApprovals.set(pid, fromStore);
+    return fromStore;
+  }
+  return undefined;
+}
+
+// ✨ Νέο: Pending για panel flow
+const pendingPanelPosts = new Map<string, PendingPanelPost>();
 
 /* =========================================================
    Slash command
@@ -224,10 +271,141 @@ export function getMarketCommands() {
 }
 
 /* =========================================================
+   Helper: Δημιουργία CASE thread
+========================================================= */
+
+async function createCaseThread(params: {
+  interaction: any;
+  kind: Kind;
+  displayTitle: string;
+  cardName?: string;
+  price?: number | null;
+  quantity?: number;
+  offerTitle?: string;
+  offerQty?: number;
+  wantTitle?: string;
+  wantQty?: number;
+  cashDelta?: number;
+  location: string;
+  extra: string;
+  photo1?: { url: string } | null;
+  photo2?: { url: string } | null;
+}) {
+  const {
+    interaction,
+    kind,
+    displayTitle,
+    cardName,
+    price,
+    quantity,
+    offerTitle,
+    offerQty,
+    wantTitle,
+    wantQty,
+    cashDelta,
+    location,
+    extra,
+    photo1,
+    photo2,
+  } = params;
+
+  const LOG_ID = env('MARKET_LOG_CHANNEL_ID');
+  const logChannel: any = interaction.guild?.channels.cache.get(LOG_ID);
+  if (!logChannel) throw new Error('⚠️ Δεν βρέθηκε MARKET_LOG_CHANNEL_ID στο .env.');
+
+  const stub = await logChannel.send(
+    `🧾 Case for **${displayTitle}** από <@${interaction.user.id}> (${kind.toUpperCase()})`,
+  );
+  const caseThread = await stub.startThread({
+    name: `CASE • ${displayTitle} — ${interaction.user.username}`,
+    autoArchiveDuration: 10080,
+    type: ChannelType.PrivateThread,
+  });
+
+  const pid = newId();
+
+  // Build summary embed and attach files so previews don't rely on external/ephemeral URLs
+  const summaryEmbed = buildCaseSummaryEmbed({
+    approval: {
+      pid,
+      kind,
+      title: displayTitle,
+      quantity,
+      price,
+      offerTitle,
+      offerQty,
+      wantTitle,
+      wantQty,
+      cashDelta,
+      location: kind === 'trade' ? undefined : location,
+      extra: kind === 'trade' ? undefined : extra,
+      requesterId: interaction.user.id,
+      images: photosToImages(photo1, photo2),
+    } as any,
+    status: 'pending',
+    sellerId: interaction.user.id,
+    buyerId: undefined,
+    contacts: [],
+  });
+
+  const files: any[] = [];
+  if (photo1 && photo1.url) {
+    const name1 = `case_${pid}_1${extFromUrl(photo1.url)}`;
+    files.push({ attachment: photo1.url, name: name1 });
+    summaryEmbed.setImage(`attachment://${name1}`);
+  }
+  if (photo2 && photo2.url) {
+    const name2 = `case_${pid}_2${extFromUrl(photo2.url)}`;
+    files.push({ attachment: photo2.url, name: name2 });
+    // keep a clickable link for the second image as well
+    summaryEmbed.addFields({ name: '📷 Επιπλέον φωτό', value: `[Δείτε εδώ](${photo2.url})` });
+  }
+
+  const caseMsg = await caseThread.send({
+    content: `📝 **Νέα αγγελία προς έγκριση** από <@${interaction.user.id}> (${kind.toUpperCase()})`,
+    embeds: [summaryEmbed],
+    components: [buildCaseReviewRow(pid)],
+    files: files.length ? files : undefined,
+  });
+  caseMsg.pin().catch(() => void 0);
+
+  const newApproval: PendingApproval = {
+    pid,
+    kind,
+    cardName,
+    price: price ?? null,
+    quantity: quantity ?? 1,
+    offerTitle,
+    offerQty,
+    wantTitle,
+    wantQty,
+    cashDelta,
+    location: location ?? '',
+    extra: extra ?? '',
+    photo1,
+    photo2,
+    caseThreadId: caseThread.id,
+    caseMessageId: caseMsg.id,
+    contacts: [],
+    requesterId: interaction.user.id,
+    status: 'pending',
+    commThreadIds: [],
+  };
+
+  pendingApprovals.set(pid, newApproval);
+  try { await persistApproval(newApproval); } catch (e) { console.error('[market] persistApproval failed', e); }
+
+  return { pid, displayTitle };
+}
+
+/* =========================================================
    Register interactions
 ========================================================= */
 
 export function registerMarketInteractions(client: Client) {
+  // initialize pendingStore asynchronously
+  pendingStore.init().catch((e) => console.error('[market] pendingStore.init failed', e));
+
   client.on('interactionCreate', async (interaction: Interaction) => {
     // ----- Slash /market post → show modal -----
     if (interaction.isChatInputCommand() && interaction.commandName === 'market') {
@@ -237,7 +415,6 @@ export function registerMarketInteractions(client: Client) {
         const photo1 = interaction.options.getAttachment('photo1');
         const photo2 = interaction.options.getAttachment('photo2');
 
-        // κρατάμε προσωρινά μέχρι το modal submit
         pendingSlashToModal.set(interaction.user.id, { kind, photo1, photo2 });
 
         const modal = new ModalBuilder().setCustomId('marketPost').setTitle('Νέα αγγελία');
@@ -302,7 +479,7 @@ export function registerMarketInteractions(client: Client) {
       return;
     }
 
-    // ----- Modal submit → CASE thread με summary + κουμπιά -----
+    // ----- Modal submit: SLASH command (marketPost) -----
     if (interaction.isModalSubmit() && interaction.customId === 'marketPost') {
       try {
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
@@ -314,22 +491,14 @@ export function registerMarketInteractions(client: Client) {
 
         const { kind, photo1, photo2 } = saved as { kind: Kind; photo1: any; photo2: any };
 
-        // κοινά
-        const requesterId = interaction.user.id;
-
-        // sell/buy
         let cardName: string | undefined;
         let quantity: number | undefined;
         let price: number | null | undefined;
-
-        // trade
         let offerTitle: string | undefined;
         let offerQty: number | undefined;
         let wantTitle: string | undefined;
         let wantQty: number | undefined;
         let cashDelta: number | undefined;
-
-        // shared extra info
         let location = '';
         let extra = '';
 
@@ -349,78 +518,26 @@ export function registerMarketInteractions(client: Client) {
           extra      = interaction.fields.getTextInputValue('extra').trim();
         }
 
-        const LOG_ID = env('MARKET_LOG_CHANNEL_ID');
-        const logChannel: any = interaction.guild?.channels.cache.get(LOG_ID);
-        if (!logChannel) return interaction.editReply('⚠️ Δεν βρέθηκε MARKET_LOG_CHANNEL_ID στο .env.');
-
         const displayTitle = kind === 'trade'
           ? `${offerTitle} ↔ ${wantTitle}`
           : cardName!;
 
-        const stub = await logChannel.send(
-          `🧾 Case for **${displayTitle}** από <@${interaction.user.id}> (${kind.toUpperCase()})`,
-        );
-        const caseThread = await stub.startThread({
-          name: `CASE • ${displayTitle} — ${interaction.user.username}`,
-          autoArchiveDuration: 10080,
-          type: ChannelType.PrivateThread,
-        });
-
-        const pid = newId();
-
-        // CASE summary (PENDING) + pin
-        const caseMsg = await caseThread.send({
-          content: `📝 **Νέα αγγελία προς έγκριση** από <@${interaction.user.id}> (${kind.toUpperCase()})`,
-          embeds: [
-            buildCaseSummaryEmbed({
-              approval: {
-                pid,
-                kind,
-                title: displayTitle,
-                // sell/buy
-                quantity: quantity ?? undefined,
-                price: price ?? undefined,
-                // trade
-                offerTitle, offerQty, wantTitle, wantQty, cashDelta,
-                // κοινά
-                location: kind === 'trade' ? undefined : location,
-                extra: kind === 'trade' ? undefined : extra,
-                requesterId,
-                images: photosToImages(
-                  photo1 ? { url: photo1.url } : null,
-                  photo2 ? { url: photo2.url } : null
-                ),
-              } as any,
-              status: 'pending',
-              sellerId: requesterId,
-              buyerId: undefined,
-              contacts: [],
-            }),
-          ],
-          components: [buildCaseReviewRow(pid)],
-        });
-        caseMsg.pin().catch(() => void 0);
-
-        pendingApprovals.set(pid, {
-          pid,
+        const { pid } = await createCaseThread({
+          interaction,
           kind,
-          // sell/buy
+          displayTitle,
           cardName,
-          price: price ?? null,
-          quantity: quantity ?? 1,
-          // trade
-          offerTitle, offerQty, wantTitle, wantQty, cashDelta,
-          // κοινά
-          location: location ?? '',
-          extra: extra ?? '',
+          price,
+          quantity,
+          offerTitle,
+          offerQty,
+          wantTitle,
+          wantQty,
+          cashDelta,
+          location,
+          extra,
           photo1: photo1 ? { url: photo1.url } : null,
           photo2: photo2 ? { url: photo2.url } : null,
-          caseThreadId: caseThread.id,
-          caseMessageId: caseMsg.id,
-          contacts: new Set<string>(),
-          requesterId,
-          status: 'pending',
-          commThreadIds: [],
         });
 
         return interaction.editReply(`📌 Δημιουργήθηκε CASE για **${displayTitle}** (pid=${pid}).`);
@@ -430,11 +547,240 @@ export function registerMarketInteractions(client: Client) {
       }
     }
 
-    // ----- Button handlers -----
+    // ✨ ----- Modal submit: PANEL flow (marketPost-sell/buy/trade) -----
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('marketPost-')) {
+      try {
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+        const kind = interaction.customId.split('-')[1] as Kind;
+
+        let cardName: string | undefined;
+        let quantity: number | undefined;
+        let price: number | null | undefined;
+        let offerTitle: string | undefined;
+        let offerQty: number | undefined;
+        let wantTitle: string | undefined;
+        let wantQty: number | undefined;
+        let cashDelta: number | undefined;
+        let location = '';
+        let extra = '';
+
+        if (kind === 'trade') {
+          offerTitle = interaction.fields.getTextInputValue('offerTitle').trim();
+          offerQty   = Number(interaction.fields.getTextInputValue('offerQty'));
+          wantTitle  = interaction.fields.getTextInputValue('wantTitle').trim();
+          wantQty    = Number(interaction.fields.getTextInputValue('wantQty'));
+          const cd   = interaction.fields.getTextInputValue('cashDelta')?.trim();
+          cashDelta  = cd ? Number(cd.replace(',', '.')) : undefined;
+        } else {
+          cardName   = interaction.fields.getTextInputValue('cardName').trim();
+          location   = interaction.fields.getTextInputValue('location').trim();
+          quantity   = Number(interaction.fields.getTextInputValue('quantity'));
+          const priceParsed = interaction.fields.getTextInputValue('price').trim();
+          price      = priceParsed ? Number(priceParsed.replace(',', '.')) : null;
+          extra      = interaction.fields.getTextInputValue('extra').trim();
+        }
+
+        // Αποθήκευση pending state
+        pendingPanelPosts.set(interaction.user.id, {
+          userId: interaction.user.id,
+          kind,
+          cardName,
+          price,
+          quantity,
+          offerTitle,
+          offerQty,
+          wantTitle,
+          wantQty,
+          cashDelta,
+          location,
+          extra,
+          createdAt: Date.now(),
+        });
+
+        // ✨ Follow-up: Ζητάει φωτογραφίες (2 επιλογές)
+        const uploadEmbed = new EmbedBuilder()
+          .setColor(0x3498db)
+          .setTitle('📷 Ανέβασε φωτογραφίες')
+          .setDescription(
+            `Επίλεξε πώς θέλεις να ανεβάσεις τις φωτογραφίες:\n\n` +
+            `📎 **Upload από υπολογιστή** (συνιστάται)\n\n` +
+            `**Αγγελία:** ${kind === 'trade' ? `${offerTitle} ↔ ${wantTitle}` : cardName}\n` +
+            `**Τύπος:** ${kind.toUpperCase()}`
+          )
+          .setFooter({ text: 'Έχεις 10 λεπτά να ολοκληρώσεις' });
+
+        const uploadButtons = new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`upload-photos:${interaction.user.id}`)
+            .setLabel('Upload Αρχεία')
+            .setEmoji('📎')
+            .setStyle(ButtonStyle.Primary)
+        );
+
+        return interaction.editReply({
+          embeds: [uploadEmbed],
+          components: [uploadButtons],
+        });
+      } catch (e) {
+        console.error('panel modal submit error', e);
+        return interaction.editReply('❌ Κάτι πήγε στραβά.');
+      }
+    }
+
+    // ✨ ----- Button: Upload photos (follow-up) -----
+    if (interaction.isButton() && interaction.customId.startsWith('upload-photos:')) {
+      try {
+        const userId = interaction.customId.split(':')[1];
+        
+        if (userId !== interaction.user.id) {
+          return interaction.reply({
+            content: '❌ Αυτό το κουμπί δεν είναι για σένα!',
+            flags: MessageFlags.Ephemeral,
+          });
+        }
+
+        const pending = pendingPanelPosts.get(userId);
+        if (!pending) {
+          return interaction.reply({
+            content: '❌ Η προσωρινή αγγελία έχει λήξει. Δοκίμασε ξανά από την αρχή.',
+            flags: MessageFlags.Ephemeral,
+          });
+        }
+
+        // Type guard: έλεγχος αν το channel υποστηρίζει message collector
+        if (!interaction.channel || !('createMessageCollector' in interaction.channel)) {
+          return interaction.reply({
+            content: '❌ Αυτό το κανάλι δεν υποστηρίζει upload αρχείων. Μετακινήσου σε κανάλι που υποστηρίζει attachments και δοκίμασε ξανά.',
+            flags: MessageFlags.Ephemeral,
+          });
+        }
+
+        // 📸 Ζητάμε να ανεβάσει φωτογραφίες ως attachments
+        await interaction.reply({
+          content: 
+            '📸 **Ανέβασε τις φωτογραφίες σου τώρα!**\n\n' +
+            '✅ Στείλε **1 ή 2 φωτογραφίες** (jpg, png, webp)\n' +
+            '⏱️ Έχεις **2 λεπτά** να τις ανεβάσεις\n' +
+            '📎 Attach τα αρχεία στο επόμενο μήνυμα\n\n' +
+            '💡 **Tip:** Μπορείς να στείλεις και τις 2 μαζί!',
+          flags: MessageFlags.Ephemeral,
+        });
+
+        // 🎯 Message collector για attachments
+        const channel = interaction.channel;
+        const filter = (m: any) => m.author.id === userId;
+        const collector = channel.createMessageCollector({
+          filter,
+          time: 120_000, // 2 minutes
+          max: 1,
+        });
+
+        collector.on('collect', async (message: any) => {
+          try {
+            const attachments = Array.from(message.attachments.values());
+            
+            // Validation: τουλάχιστον 1 φωτό
+            if (attachments.length === 0) {
+              await message.reply({
+                content: '❌ Δεν βρέθηκαν φωτογραφίες! Δοκίμασε ξανά από την αρχή.',
+              });
+              pendingPanelPosts.delete(userId);
+              return;
+            }
+
+            // Validation: μέγιστο 2 φωτό
+            if (attachments.length > 2) {
+              await message.reply({
+                content: '⚠️ Μπορείς να στείλεις **μέχρι 2 φωτογραφίες**. Χρησιμοποιήθηκαν οι πρώτες 2.',
+              });
+            }
+
+            // Validation: έλεγχος αν είναι images
+            const validImages = (attachments as any[]).filter((att: any) => 
+              att.contentType?.startsWith('image/')
+            ).slice(0, 2);
+
+            if (validImages.length === 0) {
+              await message.reply({
+                content: '❌ Τα αρχεία δεν είναι έγκυρες φωτογραφίες (jpg/png/webp)!',
+              });
+              pendingPanelPosts.delete(userId);
+              return;
+            }
+
+            const photo1 = validImages[0] ? { url: validImages[0].url } : null;
+            const photo2 = validImages[1] ? { url: validImages[1].url } : null;
+
+            const displayTitle = pending.kind === 'trade'
+              ? `${pending.offerTitle} ↔ ${pending.wantTitle}`
+              : pending.cardName!;
+
+            // ✅ Δημιουργία CASE
+            const { pid } = await createCaseThread({
+              interaction: { 
+                ...interaction, 
+                user: message.author,
+                guild: message.guild,
+              } as any,
+              kind: pending.kind,
+              displayTitle,
+              cardName: pending.cardName,
+              price: pending.price,
+              quantity: pending.quantity,
+              offerTitle: pending.offerTitle,
+              offerQty: pending.offerQty,
+              wantTitle: pending.wantTitle,
+              wantQty: pending.wantQty,
+              cashDelta: pending.cashDelta,
+              location: pending.location,
+              extra: pending.extra,
+              photo1,
+              photo2,
+            });
+
+            // Cleanup
+            pendingPanelPosts.delete(userId);
+
+            // Διαγραφή του μηνύματος με τις φωτό (για να μην μείνει στο κανάλι)
+            await message.delete().catch(() => void 0);
+
+            // Επιβεβαίωση
+            await interaction.followUp({
+              content: `✅ **Η αγγελία σου δημιουργήθηκε!**\n\n📌 **${displayTitle}**\n🆔 PID: \`${pid}\`\n⏳ Στάλθηκε για έγκριση από moderators`,
+              flags: MessageFlags.Ephemeral,
+            });
+
+          } catch (e) {
+            console.error('photo collector error', e);
+            await message.reply({
+              content: '❌ Κάτι πήγε στραβά κατά την επεξεργασία των φωτογραφιών.',
+            }).catch(() => void 0);
+          }
+        });
+
+        collector.on('end', (collected: any, reason: string) => {
+          if (reason === 'time' && collected.size === 0) {
+            // Timeout - cleanup
+            pendingPanelPosts.delete(userId);
+            interaction.followUp({
+              content: '⏱️ Το χρονικό όριο έληξε. Δοκίμασε ξανά από την αρχή.',
+              flags: MessageFlags.Ephemeral,
+            }).catch(() => void 0);
+          }
+        });
+
+      } catch (e) {
+        console.error('upload-photos button error', e);
+      }
+    }
+
+    // (Paste-URL flow removed — uploads-only enforced)
+
+    // ----- Button handlers (existing code continues...) -----
     if (!interaction.isButton()) return;
     const [action, pid] = interaction.customId.split(':');
 
-    // helper: φέρνει το CASE μήνυμα & κάνει refresh embed
     async function refreshCaseSummary(p: PendingApproval) {
       try {
         const caseThread: any = interaction.guild!.channels.cache.get(p.caseThreadId);
@@ -451,16 +797,13 @@ export function registerMarketInteractions(client: Client) {
             pid: p.pid,
             kind: p.kind,
             title: displayTitle,
-            // sell/buy
             quantity: p.quantity ?? undefined,
             price: p.price ?? undefined,
-            // trade
             offerTitle: p.offerTitle,
             offerQty: p.offerQty,
             wantTitle: p.wantTitle,
             wantQty: p.wantQty,
             cashDelta: p.cashDelta,
-            // κοινά
             location: p.location ?? undefined,
             extra: p.extra ?? undefined,
             requesterId: p.requesterId,
@@ -471,7 +814,7 @@ export function registerMarketInteractions(client: Client) {
           buyerId: p.buyerId,
           sellerConfirmed: !!p.sellerConfirmed,
           buyerConfirmed: !!p.buyerConfirmed,
-          contacts: Array.from(p.contacts ?? []),
+          contacts: (p.contacts ?? []).slice(-3),
         });
 
         const changedComponents =
@@ -487,398 +830,38 @@ export function registerMarketInteractions(client: Client) {
 
     // --- Approve ---
     if (action === 'approve') {
-      try {
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-        const payload = pendingApprovals.get(pid);
-        if (!payload) return interaction.editReply('❌ Το CASE δεν βρέθηκε.');
-
-        const member = interaction.member as GuildMember;
-        if (!isMod(member))
-          return interaction.editReply('⛔ Μόνο mods μπορούν να κάνουν approve.');
-
-        const isSell = payload.kind === 'sell';
-        const isBuy  = payload.kind === 'buy';
-        const { kind } = payload;
-
-        const displayTitle =
-          kind === 'trade'
-            ? `${payload.offerTitle ?? '—'} ↔ ${payload.wantTitle ?? '—'}`
-            : payload.cardName ?? '—';
-
-        const publicEmbed = buildPublicPostEmbed({
-          approval: {
-            pid,
-            kind,
-            title: displayTitle,
-            // sell/buy
-            quantity: payload.quantity ?? undefined,
-            price: payload.price ?? undefined,
-            // trade
-            offerTitle: payload.offerTitle,
-            offerQty: payload.offerQty,
-            wantTitle: payload.wantTitle,
-            wantQty: payload.wantQty,
-            cashDelta: payload.cashDelta,
-            // κοινά
-            location: payload.location ?? undefined,
-            extra: payload.extra ?? undefined,
-            requesterId: payload.requesterId,
-          },
-        });
-
-        // Public εικόνες: 1η στο embed, 2η ως link
-        if (payload.photo1) publicEmbed.setImage(payload.photo1.url);
-        if (payload.photo2) publicEmbed.addFields({ name: 'Επιπλέον φωτό', value: payload.photo2.url });
-
-        const targetId =
-          isSell ? env('SELL_CHANNEL_ID') :
-          isBuy  ? env('BUY_CHANNEL_ID')  :
-                   env('TRADE_CHANNEL_ID');
-
-        const targetChannel: any = interaction.guild!.channels.cache.get(targetId!);
-        if (!targetId || !targetChannel) {
-          console.error('Approve error: target channel missing', { kind, targetId });
-          return interaction.editReply('⚠️ Δεν βρέθηκε target κανάλι.');
-        }
-
-        // ✅ Public button ENABLED μετά το approve
-        const row = buildPublicPostRow(true, pid);
-        const postMsg = await targetChannel.send({ embeds: [publicEmbed], components: [row] });
-
-        // update state
-        payload.postedMessageId = postMsg.id;
-        payload.postedChannelId = targetChannel.id;
-        payload.status = 'open';
-        pendingApprovals.set(pid, payload);
-
-        saveApprovedPost({
-          pid,
-          guildId: interaction.guildId ?? undefined,
-          channelId: targetChannel.id,
-          messageId: postMsg.id,
-        });
-
-        // refresh CASE: disable AR + keep Mod Resolve enabled
-        await refreshCaseSummary(payload);
-
-        return interaction.editReply(`✅ Δημοσιεύτηκε στο ${targetChannel.toString()}.`);
-      } catch (e) {
-        console.error('approve error', e);
-        return interaction.editReply('❌ Κάτι πήγε στραβά στο approve.');
-      }
+      const { handleApprove } = await import(handlerImportPath('approve'));
+      return handleApprove(interaction, pid, loadApproval, pendingApprovals, saveApprovedPost, refreshCaseSummary, env, isMod);
     }
 
     // --- Reject ---
     if (action === 'reject') {
-      try {
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-        const payload = pendingApprovals.get(pid);
-        if (!payload) return interaction.editReply('❌ Το CASE δεν βρέθηκε.');
-
-        const member = interaction.member as GuildMember;
-        if (!isMod(member))
-          return interaction.editReply('⛔ Μόνο mods μπορούν να απορρίψουν.');
-
-        const caseThread: any = interaction.guild!.channels.cache.get(payload.caseThreadId);
-        caseThread?.send(`❌ Απορρίφθηκε από ${interaction.user}.`);
-        return interaction.editReply('⛔ Απορρίφθηκε.');
-      } catch (e) {
-        console.error('reject error', e);
-        return interaction.editReply('❌ Κάτι πήγε στραβά στο reject.');
-      }
+      const { handleReject } = await import(handlerImportPath('reject'));
+      return handleReject(interaction, pid, loadApproval, pendingApprovals, refreshCaseSummary, isMod);
     }
 
     // --- Contact ("Ενδιαφέρομαι") ---
     if (action === 'contact') {
-      try {
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-        const p = pendingApprovals.get(pid);
-        if (!p) return interaction.editReply('❌ Η αγγελία δεν βρέθηκε.');
-
-        const member = interaction.member as GuildMember;
-        const uid = interaction.user.id;
-
-        // Self-interest block (εκτός αν mod)
-        if (uid === p.requesterId && !isMod(member)) {
-          return interaction.editReply('🙅 Δεν μπορείς να ενδιαφερθείς στη **δική σου** αγγελία.');
-        }
-
-        // Πρέπει να υπάρχει δημοσιευμένο μήνυμα
-        if (!p.postedChannelId || !p.postedMessageId) {
-          return interaction.editReply('⚠️ Δεν έχει δημοσιευτεί ακόμη το public post.');
-        }
-        const channel: any = interaction.guild!.channels.cache.get(p.postedChannelId);
-        const postMessage = await channel.messages.fetch(p.postedMessageId);
-
-        // ✅ PRIVATE thread (ΟΧΙ message.startThread αν γίνεται)
-        let thread: ThreadChannel;
-        try {
-          thread = await channel.threads.create({
-            name: `deal • ${p.kind === 'trade' ? (p.offerTitle ?? '—') : (p.cardName ?? '—')} — ${interaction.user.username}`,
-            autoArchiveDuration: 1440,
-            type: ChannelType.PrivateThread,
-            reason: `Private deal thread for PID ${p.pid}`,
-          });
-        } catch {
-          // Fallback: public thread πάνω στο μήνυμα
-          thread = await postMessage.startThread({
-            name: `deal • ${p.kind === 'trade' ? (p.offerTitle ?? '—') : (p.cardName ?? '—')} — ${interaction.user.username}`,
-            autoArchiveDuration: 1440,
-          }) as ThreadChannel;
-          await thread.send('⚠️ Δεν ήταν δυνατή η δημιουργία private thread. Δημιουργήθηκε public ως fallback.');
-        }
-
-        // πρόσθεσε seller + buyer στο thread
-        try { await thread.members.add(p.requesterId); } catch {}
-        try { await thread.members.add(uid); } catch {}
-
-        // Controls + link στο original post για context
-        const origEmbed = postMessage.embeds?.[0];
-        let threadEmbed;
-        if (origEmbed) {
-          threadEmbed = EmbedBuilder.from(origEmbed);
-        } else {
-          // Fallback – αν για κάποιο λόγο δεν είχε embed το public post
-          threadEmbed = buildPublicPostEmbed({
-            approval: {
-              pid: p.pid,
-              kind: p.kind,
-              title: p.kind === 'trade'
-                ? `${p.offerTitle ?? '—'} ↔ ${p.wantTitle ?? '—'}`
-                : (p.cardName ?? '—'),
-              quantity: p.quantity ?? undefined,
-              price: p.price ?? undefined,
-              offerTitle: p.offerTitle,
-              offerQty: p.offerQty,
-              wantTitle: p.wantTitle,
-              wantQty: p.wantQty,
-              cashDelta: p.cashDelta,
-              location: p.location ?? undefined,
-              extra: p.extra ?? undefined,
-              requesterId: p.requesterId,
-            },
-          });
-          if (p.photo1) threadEmbed.setImage(p.photo1.url);
-          if (p.photo2) threadEmbed.addFields({ name: 'Επιπλέον φωτό', value: p.photo2.url });
-        }
-
-        await thread.send({
-          content: `🔔 Thread controls — πατήστε **Ολοκληρώθηκε** όταν τελειώσετε (και οι δύο).
-🔗 Σύνδεσμος στο post: ${postMessage.url}`,
-          embeds: [threadEmbed],
-          components: [buildCommThreadRow(pid)],
-        });
-
-        // ενημέρωσε state / CASE
-        p.contacts.add(uid);
-        p.buyerId = uid;
-        p.commThreadIds = Array.from(new Set([...(p.commThreadIds ?? []), thread.id]));
-        pendingApprovals.set(pid, p);
-
-        const caseThread: any = interaction.guild!.channels.cache.get(p.caseThreadId);
-        caseThread?.send(`📬 New interest by ${interaction.user} — άνοιξε **${thread.type === ChannelType.PrivateThread ? 'private' : 'public'}** thread <#${thread.id}>.`);
-
-        // refresh CASE (μένει OPEN)
-        await refreshCaseSummary(p);
-
-        return interaction.editReply('🧵 Δημιουργήθηκε **private** thread επικοινωνίας.');
-      } catch (e) {
-        console.error('contact error', e);
-        return interaction.editReply('❌ Κάτι πήγε στραβά.');
-      }
-    }
-
-    // --- Complete (στο comm thread) ---
-    if (action === 'complete') {
-      try {
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-        const p = pendingApprovals.get(pid);
-        if (!p) return interaction.editReply('❌ Η αγγελία δεν βρέθηκε.');
-
-        const member = interaction.member as GuildMember;
-        const uid = interaction.user.id;
-        const isSeller = uid === p.requesterId;
-        const isBuyer = uid === p.buyerId;
-
-        // 1η επιβεβαίωση
-        if (!p.firstConfirmBy) {
-          p.firstConfirmBy = uid;
-          p.firstConfirmAt = Date.now();
-          if (isSeller) p.sellerConfirmed = true;
-          if (isBuyer) p.buyerConfirmed = true;
-          pendingApprovals.set(pid, p);
-
-          const caseThread: any = interaction.guild!.channels.cache.get(p.caseThreadId);
-          caseThread?.send(`🕒 1η επιβεβαίωση από ${interaction.user} — περιμένουμε τον άλλο χρήστη (72h).`);
-
-          // 🔊 Δημοσίευση στο private comm thread (τρέχον κανάλι)
-          const commThread = interaction.channel;
-          if (commThread && 'isThread' in commThread && commThread.isThread()) {
-            const thread = commThread as ThreadChannel;
-            await ensureBotInPrivate(thread);
-            await thread.send(`✅ 1η επιβεβαίωση καταγράφηκε από ${interaction.user}. Περιμένουμε την άλλη πλευρά (72h).`);
-          }
-
-          await refreshCaseSummary(p);
-          try { await interaction.deleteReply(); } catch {}
-          return;
-        }
-
-        // 2η επιβεβαίωση — πρέπει να είναι άλλος, εκτός αν είναι mod
-        if (p.firstConfirmBy === uid && !isMod(member)) {
-          return interaction.editReply('ℹ️ Έχεις ήδη επιβεβαιώσει. Περιμένουμε την άλλη πλευρά (ή mod).');
-        }
-
-        // Συμπλήρωση ποιος είναι buyer/seller για το embed του public
-        let sellerId: string;
-        let buyerId: string;
-
-        if (p.kind === 'sell') {
-          sellerId = p.requesterId;
-          const other = uid === p.requesterId ? p.firstConfirmBy! : uid;
-          buyerId = other;
-        } else if (p.kind === 'buy') {
-          buyerId = p.requesterId;
-          const other = uid === p.requesterId ? p.firstConfirmBy! : uid;
-          sellerId = other;
-        } else {
-          // trade: δύο traders, απλώς ορίζουμε A/B για εμφάνιση
-          sellerId = p.requesterId;
-          const other = uid === p.requesterId ? p.firstConfirmBy! : uid;
-          buyerId = other;
-        }
-        p.buyerId = buyerId;
-        p.sellerConfirmed = p.sellerConfirmed || sellerId === p.firstConfirmBy || sellerId === uid;
-        p.buyerConfirmed = p.buyerConfirmed || buyerId === p.firstConfirmBy || buyerId === uid;
-
-        p.status = 'completed';
-        pendingApprovals.set(pid, p);
-
-        // Edit public post → [SOLD]/[BOUGHT]/[TRADED] + disable row
-        if (p.postedChannelId && p.postedMessageId) {
-          const channel: any = interaction.guild!.channels.cache.get(p.postedChannelId);
-          const message = await channel.messages.fetch(p.postedMessageId);
-          const updated = buildPublicPostEmbed({
-            approval: {
-              pid: p.pid,
-              kind: p.kind,
-              title: p.kind === 'trade'
-                ? `${p.offerTitle ?? '—'} ↔ ${p.wantTitle ?? '—'}`
-                : (p.cardName ?? '—'),
-              quantity: p.quantity ?? undefined,
-              price: p.price ?? undefined,
-              offerTitle: p.offerTitle,
-              offerQty: p.offerQty,
-              wantTitle: p.wantTitle,
-              wantQty: p.wantQty,
-              cashDelta: p.cashDelta,
-              location: p.location ?? undefined,
-              extra: p.extra ?? undefined,
-              requesterId: p.requesterId,
-            },
-            statusTag: p.kind === 'sell' ? 'sold' : p.kind === 'buy' ? 'bought' : 'traded',
-            dealBetween: { sellerId, buyerId },
-          });
-          await message.edit({ embeds: [updated], components: [buildPublicPostRow(false, pid)] });
-        }
-
-        // Κλείδωμα/αρχειοθέτηση όλων των comm threads (fetch + one-shot edit)
-        const currentThreadId = (interaction.channel as ThreadChannel | null)?.id;
-        for (const tid of p.commThreadIds ?? []) {
-          try {
-            const th = await fetchThreadSafe(interaction.guild!, tid);
-            if (!th) {
-              console.warn('[market] comm thread not found on complete:', tid);
-              continue;
-            }
-            const note = tid !== currentThreadId
-              ? `ℹ️ Η αγγελία ολοκληρώθηκε με <@${sellerId}> ↔ <@${buyerId}>. Το thread κλειδώνει & αρχειοθετείται.`
-              : '🏁 Το deal ολοκληρώθηκε. Το thread κλειδώνει & αρχειοθετείται.';
-            await lockAndArchiveThread(th, note);
-          } catch (e) {
-            console.error('[market] complete: lock/archive failed for', tid, e);
-          }
-        }
-
-        const caseThread: any = interaction.guild!.channels.cache.get(p.caseThreadId);
-        caseThread?.send(`🏁 Completed — <@${sellerId}> ↔ <@${buyerId}>.`);
-
-        await refreshCaseSummary(p);
-        try { await interaction.deleteReply(); } catch {}
-        return;
-      } catch (e) {
-        console.error('complete error', e);
-        return interaction.editReply('❌ Κάτι πήγε στραβά στο complete.');
-      }
+      const { handleContact } = await import(handlerImportPath('contact'));
+      return handleContact(interaction, pid, loadApproval, pendingApprovals, refreshCaseSummary, isMod);
     }
 
     // --- Close (από mod/owner) ---
     if (action === 'close') {
-      try {
-        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-        const p = pendingApprovals.get(pid);
-        if (!p) return interaction.editReply('❌ Η αγγελία δεν βρέθηκε/ή δεν έχει CASE.');
-
-        const member = interaction.member as GuildMember;
-        const isOwner = interaction.user.id === p.requesterId;
-        if (!isOwner && !isMod(member)) {
-          return interaction.editReply('⛔ Μόνο owner ή mod μπορεί να κλείσει την αγγελία.');
-        }
-
-        // edit public post → [CLOSED] + disable row
-        const channel: any = interaction.guild!.channels.cache.get(p.postedChannelId!);
-        if (channel && p.postedMessageId) {
-          const message = await channel.messages.fetch(p.postedMessageId);
-          const orig = message.embeds?.[0];
-          if (orig) {
-            const updated = EmbedBuilder.from(orig).setTitle(`[CLOSED] ${orig.title}`);
-            const disabledRow = buildPublicPostRow(false, pid);
-            await message.edit({ embeds: [updated], components: [disabledRow] });
-          }
-        }
-
-        // κλείδωσε/αρχειοθέτησε όλα τα comm threads (fetch + one-shot edit)
-        for (const tid of p.commThreadIds ?? []) {
-          try {
-            const th = await fetchThreadSafe(interaction.guild!, tid);
-            if (!th) {
-              console.warn('[market] comm thread not found on close:', tid);
-              continue;
-            }
-            await lockAndArchiveThread(th, '🔒 Η αγγελία έκλεισε. Το thread κλειδώνει & αρχειοθετείται.');
-          } catch (e) {
-            console.error('[market] close: lock/archive failed for', tid, e);
-          }
-        }
-
-        // refresh CASE status
-        p.status = 'closed';
-        pendingApprovals.set(pid, p);
-        await refreshCaseSummary(p);
-
-        // log στο CASE
-        if (p.caseThreadId) {
-          const caseThread: any = interaction.guild!.channels.cache.get(p.caseThreadId);
-          caseThread?.send(`🔒 Κλείσιμο αγγελίας από ${isOwner ? 'owner' : 'mod'} ${interaction.user}.`);
-        }
-
-        return interaction.editReply('🔒 Η αγγελία έκλεισε.');
-      } catch (e) {
-        console.error('close error', e);
-        return interaction.editReply('❌ Κάτι πήγε στραβά στο close.');
-      }
+      const { handleClose } = await import(handlerImportPath('close'));
+      return handleClose(interaction, pid, loadApproval, pendingApprovals, refreshCaseSummary, isMod, fetchThreadSafe, lockAndArchiveThread);
     }
 
-    // --- Mod Resolve (placeholder – μόνο log) ---
+    // --- Mod Resolve (placeholder – delegate to handler) ---
     if (action === 'resolve') {
-      if (!interaction.isButton()) return;
-      await interaction.reply({ content: '🛡️ Mod Resolve (placeholder)', flags: MessageFlags.Ephemeral });
-      return;
+      const { handleResolve } = await import(handlerImportPath('modResolve'));
+      return handleResolve(interaction, pid);
+    }
+
+    // --- Complete (deal finished in a comm thread) ---
+    if (action === 'complete') {
+      const { handleComplete } = await import(handlerImportPath('complete'));
+      return handleComplete(interaction, pid, loadApproval, pendingApprovals, refreshCaseSummary, fetchThreadSafe, lockAndArchiveThread);
     }
   });
 }
@@ -900,4 +883,15 @@ function saveApprovedPost(entry: Approved) {
   if (idx >= 0) data[idx] = entry;
   else data.push(entry);
   writeJsonAtomic(FILES.approvals, data);
+}
+
+// Optional: load persisted approvals into memory (call from index.ts if desired)
+export async function loadPersistedApprovals() {
+  try {
+    await pendingStore.init();
+    // load all approvals from pendingStore.mem -- helper not exposed, so read via getApproval keys is limited
+    // We can load known files by reading the file directly, but keep it simple: no-op here.
+  } catch (e) {
+    console.error('[market] loadPersistedApprovals failed', e);
+  }
 }

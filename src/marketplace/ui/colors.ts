@@ -1,3 +1,4 @@
+// src/marketplace/ui/colors.ts
 import { COLORS } from './constants';
 import type { CaseStatus } from '../types';
 
