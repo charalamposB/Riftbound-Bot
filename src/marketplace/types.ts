@@ -1,3 +1,4 @@
+// src/marketplace/types.ts
 export type Kind = 'sell' | 'buy' | 'trade';
 
 export type CaseStatus =
