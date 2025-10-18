@@ -1,3 +1,4 @@
+// src/marketplace/ui/index.ts
 export * from './embeds';
 export * from './colors';
 export * from './constants';

@@ -1,4 +1,4 @@
-// Χρώματα & σταθερές που θα ξαναχρησιμοποιούμε παντού.
+// src/marketplace/ui/constants.ts
 
 export const COLORS = {
   pending: 0xF1C40F,   // κίτρινο

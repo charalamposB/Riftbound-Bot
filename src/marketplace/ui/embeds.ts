@@ -1,3 +1,4 @@
+// src/marketplace/ui/embeds.ts
 import { EmbedBuilder, userMention } from 'discord.js';
 import { caseColor } from './colors';
 import { COLORS, LABELS } from './constants';

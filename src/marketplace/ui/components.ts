@@ -1,3 +1,4 @@
+// src/marketplace/ui/components.ts
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js'
 import { EMOJI } from './constants'
 
